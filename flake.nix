@@ -26,6 +26,22 @@
             };
           }
         );
+      linuxSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      forEachLinuxSystem =
+        f:
+        lib.genAttrs linuxSystems (
+          system:
+          f {
+            inherit system;
+            pkgs = import inputs.nixpkgs {
+              inherit system;
+              config.allowUnfree = true;
+            };
+          }
+        );
     in
     {
       packages = forEachSupportedSystem (
@@ -38,6 +54,21 @@
 
       nixosModules.default = ./default.nix;
       nixosModules.nix-ld-cache = ./default.nix;
+
+      checks = forEachLinuxSystem (
+        { pkgs, system }:
+        let
+          package = self.packages.${system}.default;
+        in
+        {
+          module-environment = pkgs.testers.runNixOSTest (import ./tests/module-environment.nix {
+            inherit self pkgs package;
+          });
+          cache-learning = pkgs.testers.runNixOSTest (import ./tests/cache-learning.nix {
+            inherit self pkgs package;
+          });
+        }
+      );
 
       devShells = forEachSupportedSystem (
         { pkgs, system }:
