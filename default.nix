@@ -15,6 +15,7 @@ let
       LD_AUDIT = "${cfg.package}/lib/libnix-ld-cache-audit.so";
       NIX_LD_AUDIT_CACHE_DIR = cfg.cacheDir;
       NIX_LD_AUDIT_SOCKET = cfg.socketPath;
+      GLIBC_TUNABLES = "glibc.rtld.optional_static_tls=${toString cfg.staticTlsSurplus}";
     }
     // lib.optionalAttrs cfg.debug {
       NIX_LD_AUDIT_DEBUG = "1";
@@ -54,6 +55,26 @@ in
       description = "Expose the shared cache and daemon socket to Nix sandboxes and configure nix-daemon to export the audit environment.";
     };
 
+    staticTlsSurplus = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 16384;
+      description = ''
+        Bytes added to glibc's optional static TLS surplus via
+        `glibc.rtld.optional_static_tls`.
+
+        Loading any `LD_AUDIT` module reserves an extra link-map namespace, which
+        consumes part of the fixed static TLS surplus (`_dl_tls_static_surplus_init`
+        in glibc's `elf/dl-tls.c` adds the audit count to `nns`). Libraries that
+        need initial-exec TLS at `dlopen` time then fail with "cannot allocate
+        memory in static TLS block" — Determinate Nix hits this on `libnixexpr.so`
+        and `libjemalloc.so`, which breaks `nix-daemon` outright.
+
+        Measured threshold for Determinate Nix 3.20.0 is between 7168 and 7680
+        bytes; the default leaves headroom. Raise it if other `dlopen`ed
+        initial-exec TLS consumers fail the same way.
+      '';
+    };
+
     debug = lib.mkEnableOption "debug logging for nix-ld-cache";
   };
 
@@ -79,12 +100,10 @@ in
         cfg.cacheDir
         "/run/${runtimeName}"
       ];
-      impure-env = [
-        "LD_AUDIT=${auditEnvironment.LD_AUDIT}"
-        "NIX_LD_AUDIT_CACHE_DIR=${auditEnvironment.NIX_LD_AUDIT_CACHE_DIR}"
-        "NIX_LD_AUDIT_SOCKET=${auditEnvironment.NIX_LD_AUDIT_SOCKET}"
-      ]
-      ++ lib.optional cfg.debug "NIX_LD_AUDIT_DEBUG=1";
+      # Derived from auditEnvironment so no variable can be missed here: the
+      # scope key includes GLIBC_TUNABLES, so a mismatch between contexts would
+      # silently split the cache.
+      impure-env = lib.mapAttrsToList (name: value: "${name}=${value}") auditEnvironment;
     };
 
     systemd.services.nix-daemon.environment = lib.mkIf cfg.nixSandboxIntegration auditEnvironment;
@@ -107,11 +126,15 @@ in
         ExecStart = "${cfg.package}/bin/nix-ld-cache-daemon --socket ${lib.escapeShellArg cfg.socketPath} --cache-dir ${lib.escapeShellArg cfg.cacheDir}${lib.optionalString cfg.debug " --debug"}";
         Restart = "on-failure";
         RestartSec = 1;
+        # Cleared so the daemon never audits itself. GLIBC_TUNABLES is only
+        # needed to offset the audit module's TLS reservation, which does not
+        # apply here.
         Environment = [
           "LD_AUDIT="
           "NIX_LD_AUDIT_CACHE_DIR="
           "NIX_LD_AUDIT_SOCKET="
           "NIX_LD_AUDIT_DEBUG="
+          "GLIBC_TUNABLES="
         ];
         DynamicUser = true;
         UMask = "0022";
