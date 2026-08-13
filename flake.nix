@@ -46,14 +46,16 @@
     {
       packages = forEachSupportedSystem (
         { pkgs, ... }:
-        {
-          default = pkgs.callPackage ./package.nix { };
-          nix-ld-cache = pkgs.callPackage ./package.nix { };
+        rec {
+          default = nix-ld-cache;
+          nix-ld-cache = pkgs.callPackage ./nix-ld-cache/package.nix { };
         }
       );
 
-      nixosModules.default = ./default.nix;
-      nixosModules.nix-ld-cache = ./default.nix;
+      nixosModules = rec {
+        default = nix-ld-cache;
+        nix-ld-cache = ./default.nix;
+      };
 
       checks = forEachLinuxSystem (
         { pkgs, system }:
@@ -61,12 +63,16 @@
           package = self.packages.${system}.default;
         in
         {
-          module-environment = pkgs.testers.runNixOSTest (import ./tests/module-environment.nix {
-            inherit self pkgs package;
-          });
-          cache-learning = pkgs.testers.runNixOSTest (import ./tests/cache-learning.nix {
-            inherit self pkgs package;
-          });
+          module-environment = pkgs.testers.runNixOSTest (
+            import ./tests/module-environment.nix {
+              inherit self pkgs package;
+            }
+          );
+          cache-learning = pkgs.testers.runNixOSTest (
+            import ./tests/cache-learning.nix {
+              inherit self pkgs package;
+            }
+          );
         }
       );
 

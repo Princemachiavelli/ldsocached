@@ -1,4 +1,10 @@
-{ lib, stdenv }:
+{
+  lib,
+  stdenv,
+  makeWrapper,
+  strace,
+  ripgrep,
+}:
 
 stdenv.mkDerivation {
   pname = "nix-ld-cache";
@@ -8,11 +14,17 @@ stdenv.mkDerivation {
 
   dontConfigure = true;
 
+  nativeBuildInputs = [ makeWrapper ];
+
   buildPhase = ''
     runHook preBuild
-    $CC -D_GNU_SOURCE -fPIC -shared -O2 -Wall -Wextra -Wformat -Wformat-security \
+    # No -fvisibility=hidden: it hides the la_* hooks and glibc then refuses to
+    # load the module as an audit interface.
+    $CC -fPIC -shared -O2 -Wall -Wextra -Wformat -Wformat-security \
+      -D_FORTIFY_SOURCE=3 -fstack-protector-strong -Wl,-z,relro,-z,now \
       -o libnix-ld-cache-audit.so nix-ld-cache-audit.c -pthread
-    $CC -D_GNU_SOURCE -O2 -Wall -Wextra -Wformat -Wformat-security \
+    $CC -O2 -Wall -Wextra -Wformat -Wformat-security \
+      -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now \
       -o nix-ld-cache-daemon nix-ld-cache-daemon.c
     runHook postBuild
   '';
@@ -24,7 +36,8 @@ stdenv.mkDerivation {
     cp nix-ld-cache-daemon $out/bin/
     cp benchmark.sh $out/bin/nix-ld-cache-benchmark
     chmod +x $out/bin/nix-ld-cache-benchmark
-    cp README.md $out/share/doc/nix-ld-cache/
+    wrapProgram $out/bin/nix-ld-cache-benchmark \
+      --prefix PATH : ${lib.makeBinPath [ strace ripgrep ]}
     runHook postInstall
   '';
 

@@ -7,6 +7,9 @@
 
 let
   cfg = config.programs.nix-ld-cache;
+  # Single source of truth for CacheDirectory=/RuntimeDirectory= and the paths
+  # derived from them.
+  runtimeName = "nix-ld-cache";
   auditEnvironment =
     {
       LD_AUDIT = "${cfg.package}/lib/libnix-ld-cache-audit.so";
@@ -33,16 +36,16 @@ in
 
     cacheDir = lib.mkOption {
       type = lib.types.str;
-      default = "/var/cache/nix-ld-cache";
-      example = "/var/cache/nix-ld-cache";
-      description = "Shared cache root for resolved library paths.";
+      readOnly = true;
+      default = "/var/cache/${runtimeName}";
+      description = "Shared cache root for resolved library paths. Fixed by the hardened service's CacheDirectory=.";
     };
 
     socketPath = lib.mkOption {
       type = lib.types.str;
-      default = "/run/nix-ld-cache/learn.sock";
-      example = "/run/nix-ld-cache/learn.sock";
-      description = "Unix socket path used by the privileged cache writer.";
+      readOnly = true;
+      default = "/run/${runtimeName}/learn.sock";
+      description = "Unix socket path used by the privileged cache writer. Fixed by the hardened service's RuntimeDirectory=.";
     };
 
     nixSandboxIntegration = lib.mkOption {
@@ -57,12 +60,10 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.cacheDir == "/var/cache/nix-ld-cache";
-        message = "programs.nix-ld-cache.cacheDir must remain /var/cache/nix-ld-cache when using the hardened DynamicUser service.";
-      }
-      {
-        assertion = cfg.socketPath == "/run/nix-ld-cache/learn.sock";
-        message = "programs.nix-ld-cache.socketPath must remain /run/nix-ld-cache/learn.sock when using the hardened DynamicUser service.";
+        assertion =
+          !cfg.nixSandboxIntegration
+          || lib.elem "configurable-impure-env" (config.nix.settings.experimental-features or [ ]);
+        message = "programs.nix-ld-cache.nixSandboxIntegration sets nix.settings.impure-env, which requires the configurable-impure-env experimental feature. Add it to nix.settings.experimental-features or set nixSandboxIntegration = false.";
       }
     ];
 
@@ -76,7 +77,7 @@ in
     nix.settings = lib.mkIf cfg.nixSandboxIntegration {
       extra-sandbox-paths = [
         cfg.cacheDir
-        "/run/nix-ld-cache"
+        "/run/${runtimeName}"
       ];
       impure-env = [
         "LD_AUDIT=${auditEnvironment.LD_AUDIT}"
@@ -103,7 +104,7 @@ in
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/nix-ld-cache-daemon --socket ${lib.escapeShellArg cfg.socketPath} --cache-dir ${lib.escapeShellArg cfg.cacheDir}";
+        ExecStart = "${cfg.package}/bin/nix-ld-cache-daemon --socket ${lib.escapeShellArg cfg.socketPath} --cache-dir ${lib.escapeShellArg cfg.cacheDir}${lib.optionalString cfg.debug " --debug"}";
         Restart = "on-failure";
         RestartSec = 1;
         Environment = [
@@ -114,10 +115,13 @@ in
         ];
         DynamicUser = true;
         UMask = "0022";
-        CacheDirectory = "nix-ld-cache";
+        CacheDirectory = runtimeName;
         CacheDirectoryMode = "0755";
-        RuntimeDirectory = "nix-ld-cache";
+        RuntimeDirectory = runtimeName;
         RuntimeDirectoryMode = "0755";
+        # One fd-table slot per connection is not enough: each also holds a
+        # /proc/<pid> dirfd and a pidfd.
+        LimitNOFILE = 4096;
         PermissionsStartOnly = false;
         NoNewPrivileges = true;
         PrivateTmp = true;
@@ -136,6 +140,9 @@ in
         RestrictNamespaces = true;
         SystemCallArchitectures = "native";
         RestrictAddressFamilies = [ "AF_UNIX" ];
+        # /proc/<pid>/environ is gated by PTRACE_MODE_READ (see environ_open in
+        # fs/proc/base.c), so reading a peer's LD_LIBRARY_PATH needs
+        # CAP_SYS_PTRACE in addition to CAP_DAC_READ_SEARCH.
         CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE" ];
         AmbientCapabilities = [ "CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE" ];
       };
