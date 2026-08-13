@@ -76,6 +76,10 @@
         }
       );
 
+      overlays.default = prev: final: {
+        nix-ld-cache = prev.callPackage ./nix-ld-cache/package.nix { };
+      };
+
       devShells = forEachSupportedSystem (
         { pkgs, system }:
         {
