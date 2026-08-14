@@ -23,6 +23,7 @@
 #include "protocol.h"
 
 #define STORE_PREFIX "/nix/store/"
+#define RUN_PREFIX "/run/"
 
 /* One cached file per requester scope. glibc holds dl_load_lock across an entire
  * DT_NEEDED search, so a process resolves one requester at a time and a single
@@ -114,6 +115,12 @@ xstrdup(const char *value)
 }
 
 static bool
+starts_with(const char *value, const char *prefix)
+{
+  return strncmp(value, prefix, strlen(prefix)) == 0;
+}
+
+static bool
 path_is_absolute(const char *path)
 {
   return path != NULL && path[0] == '/';
@@ -122,7 +129,7 @@ path_is_absolute(const char *path)
 static bool
 path_is_safe_store_path(const char *path)
 {
-  if (path == NULL || strncmp(path, STORE_PREFIX, strlen(STORE_PREFIX)) != 0) {
+  if (path == NULL || !starts_with(path, STORE_PREFIX)) {
     return false;
   }
 
@@ -224,13 +231,29 @@ readlink_dup(const char *path)
 }
 
 static char *
+requester_cache_path(const char *path)
+{
+  if (path != NULL && starts_with(path, RUN_PREFIX)) {
+    char *resolved = realpath(path, NULL);
+    if (resolved != NULL) {
+      if (path_is_safe_store_path(resolved)) {
+        return resolved;
+      }
+      free(resolved);
+    }
+  }
+
+  return xstrdup(path);
+}
+
+static char *
 requester_identity(uintptr_t cookie_value)
 {
   const struct link_map *map = (const struct link_map *) cookie_value;
 
   /* The main executable's l_name is empty, so fall back to /proc/self/exe. */
   if (map != NULL && map->l_name != NULL && map->l_name[0] != '\0') {
-    char *resolved = xstrdup(map->l_name);
+    char *resolved = requester_cache_path(map->l_name);
     if (resolved != NULL) {
       return resolved;
     }

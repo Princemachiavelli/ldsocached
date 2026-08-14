@@ -82,6 +82,64 @@ let
     '';
   };
 
+  runRequesterLib = pkgs.stdenv.mkDerivation {
+    pname = "ldsocached-run-requester-lib";
+    version = "0.1.0";
+
+    dontUnpack = true;
+    dontConfigure = true;
+
+    buildPhase = ''
+      cat > requester-lib.c <<'EOF'
+      int demo_value(void);
+
+      int requester_value(void) {
+        return demo_value();
+      }
+      EOF
+
+      $CC -fPIC -shared -Wl,-soname,librequester.so -o librequester.so requester-lib.c \
+        -L${demoLib}/lib -ldemo -Wl,-rpath,${demoLib}/lib -Wl,--enable-new-dtags
+    '';
+
+    installPhase = ''
+      mkdir -p $out/lib
+      cp librequester.so $out/lib/
+    '';
+  };
+
+  runRequesterApp = pkgs.stdenv.mkDerivation {
+    pname = "ldsocached-run-requester-app";
+    version = "0.1.0";
+
+    dontUnpack = true;
+    dontConfigure = true;
+
+    buildPhase = ''
+      cat > run-requester-app.c <<'EOF'
+      #include <stdio.h>
+
+      int requester_value(void);
+
+      int main(void) {
+        printf("run-%d\n", requester_value());
+        fflush(stdout);
+        return 0;
+      }
+      EOF
+
+      $CC -o run-requester-app run-requester-app.c \
+        -L${runRequesterLib}/lib -lrequester \
+        -Wl,-rpath,/run/ldsocached-run-libs -Wl,--enable-new-dtags \
+        -Wl,-rpath-link,${demoLib}/lib
+    '';
+
+    installPhase = ''
+      mkdir -p $out/bin
+      cp run-requester-app $out/bin/
+    '';
+  };
+
   # Submits a resolution request as an unprivileged user. The protocol carries
   # only {requester, soname}, so a client cannot name a path at all -- this
   # exercises that the daemon derives the answer regardless of who asks.
@@ -157,6 +215,7 @@ in
       environment.systemPackages = [
         package
         demoApp
+        runRequesterApp
         forgeClaim
         stallClients
         pkgs.python3
@@ -254,6 +313,41 @@ in
         machine.fail(
             "grep -R --fixed-strings '/tmp/mylibs/libdemo.so' /var/cache/nix-ld-cache"
         )
+
+    with subtest("a /run requester symlink is keyed by its store target"):
+        machine.succeed("rm -f /var/cache/nix-ld-cache/*.tsv")
+        machine.succeed(
+            "rm -rf /run/ldsocached-run-libs && mkdir -p /run/ldsocached-run-libs"
+        )
+        machine.succeed(
+            "ln -s ${runRequesterLib}/lib/librequester.so "
+            "/run/ldsocached-run-libs/librequester.so"
+        )
+        out = machine.succeed(
+            "su alice -c 'NIX_LD_AUDIT_DEBUG=1 "
+            "${runRequesterApp}/bin/run-requester-app' 2>&1"
+        )
+        assert "run-7" in out, f"expected the program to work, got: {out}"
+        assert (
+            "cache miss requester=${runRequesterLib}/lib/librequester.so soname=libdemo.so"
+            in out
+        ), f"expected cache miss keyed by store requester, got: {out}"
+        assert (
+            "requester=/run/ldsocached-run-libs/librequester.so soname=libdemo.so"
+            not in out
+        ), f"expected no /run requester key, got: {out}"
+        machine.wait_until_succeeds(
+            "grep -R --fixed-strings '${demoLib}/lib/libdemo.so' /var/cache/nix-ld-cache"
+        )
+        out = machine.succeed(
+            "su alice -c 'NIX_LD_AUDIT_DEBUG=1 "
+            "${runRequesterApp}/bin/run-requester-app' 2>&1"
+        )
+        assert (
+            "cache hit requester=${runRequesterLib}/lib/librequester.so soname=libdemo.so"
+            in out
+        ), f"expected cache hit keyed by store requester, got: {out}"
+        assert "run-7" in out, f"expected the program to still work, got: {out}"
 
     with subtest("a stalled client does not block other clients"):
         machine.succeed(
