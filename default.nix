@@ -10,6 +10,10 @@ let
   # Single source of truth for CacheDirectory=/RuntimeDirectory= and the paths
   # derived from them.
   runtimeName = "nix-ld-cache";
+  # DynamicUser= derives both a user and a group from the unit name, so the
+  # shared group must not collide with it (that fails at step USER with
+  # "User or group with specified name already exists").
+  cacheGroup = "nix-ld-cache-readers";
   auditEnvironment =
     {
       LD_AUDIT = "${cfg.package}/lib/libnix-ld-cache-audit.so";
@@ -90,6 +94,19 @@ in
 
     environment.systemPackages = [ cfg.package ];
 
+    # The shared cache must be world-readable: every audited process reads it
+    # directly, and a read that fails makes the cache write-only. It is therefore
+    # managed by tmpfiles rather than CacheDirectory=, which under DynamicUser=
+    # would place the real directory under /var/cache/private (mode 0700, root)
+    # and make it unreadable for exactly the clients it exists to serve.
+    users.groups.${cacheGroup} = { };
+
+    systemd.tmpfiles.settings.${runtimeName}.${cfg.cacheDir}.d = {
+      user = "root";
+      group = cacheGroup;
+      mode = "0775";
+    };
+
     environment.sessionVariables = auditEnvironment;
 
     systemd.settings.Manager.DefaultEnvironment = auditEnvironmentString;
@@ -119,7 +136,12 @@ in
         "local-fs.target"
         "systemd-tmpfiles-setup.service"
       ];
-      wants = [ "local-fs.target" ];
+      # DefaultDependencies=false means nothing else pulls these in, and the
+      # shared cache directory does not exist until tmpfiles has run.
+      wants = [
+        "local-fs.target"
+        "systemd-tmpfiles-setup.service"
+      ];
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
         Type = "simple";
@@ -137,9 +159,14 @@ in
           "GLIBC_TUNABLES="
         ];
         DynamicUser = true;
-        UMask = "0022";
-        CacheDirectory = runtimeName;
-        CacheDirectoryMode = "0755";
+        # Writes must land group-writable-by-default so the group grant is what
+        # actually governs access, and world-readable so clients can read them.
+        UMask = "0002";
+        # Group membership, not CacheDirectory=, is what grants write access to
+        # the tmpfiles-managed shared cache; ProtectSystem=strict makes /var
+        # read-only, so the path must be listed explicitly.
+        SupplementalGroups = [ cacheGroup ];
+        ReadWritePaths = [ cfg.cacheDir ];
         RuntimeDirectory = runtimeName;
         RuntimeDirectoryMode = "0755";
         # One fd-table slot per connection is not enough: each also holds a

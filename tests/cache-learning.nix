@@ -191,6 +191,22 @@ in
             "test \"$(grep -c '^demo-7$' /tmp/ldsocached-demo.out)\" = 2"
         )
 
+    with subtest("an unprivileged client can actually read the shared cache"):
+        # The program works either way -- glibc resolves it without us -- so
+        # asserting output alone cannot tell a hit from a miss. These check the
+        # cache is readable by the clients it exists to serve: under
+        # DynamicUser=, CacheDirectory= would hide it beneath
+        # /var/cache/private (0700 root) and make every lookup fail with EACCES,
+        # leaving the cache write-only and startup strictly slower.
+        machine.succeed("su alice -c 'test -r /var/cache/nix-ld-cache'")
+        machine.succeed("su alice -c 'cat /var/cache/nix-ld-cache/*.tsv > /dev/null'")
+        out = machine.succeed(
+            "su alice -c 'NIX_LD_AUDIT_DEBUG=1 ${demoApp}/bin/demo-app' 2>&1"
+        )
+        assert "cache hit" in out, f"expected a cache hit, got: {out}"
+        assert "${demoLib}/lib/libdemo.so" in out, f"expected the real lib, got: {out}"
+        assert "demo-7" in out, f"expected the program to still work, got: {out}"
+
     with subtest("a client cannot name the path that gets cached"):
         # The submitter asks about libdemo.so for demo-app. The daemon derives
         # the answer from demo-app's own RUNPATH, so the evil library -- which

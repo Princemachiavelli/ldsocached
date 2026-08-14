@@ -759,7 +759,9 @@ commit_cache_entry(const char *cache_dir, const char *requester_path,
   char *line = NULL;
   int line_len = asprintf(&line, "%s\t%s\n", soname, path);
   if (line_len > 0) {
-    int fd = open(cache_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    /* 0664: every audited process reads this file directly, and the group is
+     * what grants the daemon write access across DynamicUser uid changes. */
+    int fd = open(cache_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0664);
     if (fd >= 0) {
       /* One write so concurrent readers never observe a torn line. */
       if (write_full(fd, line, (size_t) line_len) != 0) {

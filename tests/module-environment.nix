@@ -53,6 +53,32 @@
 
     machine.succeed("test -S /run/nix-ld-cache/learn.sock")
     machine.succeed("test -d /var/cache/nix-ld-cache")
+
+    with subtest("the shared cache is a real world-readable directory"):
+        # Not a symlink into /var/cache/private: that is what CacheDirectory=
+        # plus DynamicUser= produces, and it is unreadable by clients.
+        machine.succeed("test ! -L /var/cache/nix-ld-cache")
+        machine.succeed("su - alice -c 'test -r /var/cache/nix-ld-cache'")
+        machine.succeed("su - alice -c 'ls /var/cache/nix-ld-cache >/dev/null'")
+        owner = machine.succeed("stat -c '%U:%G:%a' /var/cache/nix-ld-cache").strip()
+        assert owner == "root:nix-ld-cache-readers:775", f"unexpected cache dir mode: {owner}"
+
+    with subtest("the daemon writes via group membership, not CacheDirectory="):
+        # systemctl show does not expose SupplementalGroups, and the unit's
+        # effective groups are the thing that actually matters: assert the
+        # running process holds the shared group and can write the cache.
+        pid = machine.succeed(
+            "systemctl show -p MainPID --value nix-ld-cache.service"
+        ).strip()
+        gid = machine.succeed(f"grep '^Groups:' /proc/{pid}/status").split()[1:]
+        want = machine.succeed("getent group nix-ld-cache-readers | cut -d: -f3").strip()
+        assert want in gid, f"daemon lacks the shared group: Groups={gid} want={want}"
+        machine.succeed(
+            "test \"$(stat -c %G /var/cache/nix-ld-cache)\" = nix-ld-cache-readers"
+        )
+        # A committed entry proves the write path works end to end.
+        machine.succeed("test -n \"$(ls -A /var/cache/nix-ld-cache)\"")
+
     machine.succeed("grep -F 'DefaultEnvironment=LD_AUDIT=' /etc/systemd/system.conf")
     machine.succeed("grep -F 'DefaultEnvironment=LD_AUDIT=' /etc/systemd/user.conf")
     machine.succeed("grep -F 'LD_AUDIT=' /tmp/ldsocached-system-env")
