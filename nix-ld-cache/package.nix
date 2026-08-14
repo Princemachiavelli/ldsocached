@@ -33,11 +33,17 @@ stdenv.mkDerivation {
     runHook preInstall
     mkdir -p $out/bin $out/lib $out/share/doc/nix-ld-cache
     cp libnix-ld-cache-audit.so $out/lib/
+    ln -s libnix-ld-cache-audit.so $out/lib/nix-ld-cache.so
     cp nix-ld-cache-daemon $out/bin/
     cp benchmark.sh $out/bin/nix-ld-cache-benchmark
     chmod +x $out/bin/nix-ld-cache-benchmark
     wrapProgram $out/bin/nix-ld-cache-benchmark \
-      --prefix PATH : ${lib.makeBinPath [ strace ripgrep ]}
+      --prefix PATH : ${
+        lib.makeBinPath [
+          strace
+          ripgrep
+        ]
+      }
     runHook postInstall
   '';
 

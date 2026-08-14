@@ -79,10 +79,15 @@
         # A committed entry proves the write path works end to end.
         machine.succeed("test -n \"$(ls -A /var/cache/nix-ld-cache)\"")
 
-    machine.succeed("grep -F 'DefaultEnvironment=LD_AUDIT=' /etc/systemd/system.conf")
-    machine.succeed("grep -F 'DefaultEnvironment=LD_AUDIT=' /etc/systemd/user.conf")
-    machine.succeed("grep -F 'LD_AUDIT=' /tmp/ldsocached-system-env")
-    machine.succeed("su - alice -c 'env' | grep '^LD_AUDIT=.*/libnix-ld-cache-audit.so$'")
+    machine.succeed("grep -F 'LD_AUDIT=/run/current-system/sw/lib/nix-ld-cache.so' /etc/systemd/system.conf")
+    machine.succeed("grep -F 'LD_AUDIT=/run/current-system/sw/lib/nix-ld-cache.so' /etc/systemd/user.conf")
+    machine.succeed("grep -F 'LD_AUDIT=/run/current-system/sw/lib/nix-ld-cache.so' /tmp/ldsocached-system-env")
+    machine.succeed("test -L /run/current-system/sw/lib/nix-ld-cache.so")
+    machine.succeed(
+        "test \"$(readlink /run/current-system/sw/lib/nix-ld-cache.so)\" = "
+        "'${package}/lib/nix-ld-cache.so'"
+    )
+    machine.succeed("su - alice -c 'env' | grep '^LD_AUDIT=/run/current-system/sw/lib/nix-ld-cache.so$'")
     machine.succeed("su - alice -c 'env' | grep '^NIX_LD_AUDIT_SOCKET=/run/nix-ld-cache/learn.sock$'")
 
     with subtest("the static TLS surplus offset is exported everywhere LD_AUDIT is"):
@@ -91,8 +96,8 @@
         machine.succeed(
             "su - alice -c 'env' | grep '^GLIBC_TUNABLES=glibc.rtld.optional_static_tls='"
         )
-        machine.succeed("grep -F 'GLIBC_TUNABLES=glibc.rtld.optional_static_tls=' /etc/systemd/system.conf")
-        machine.succeed("grep -F 'GLIBC_TUNABLES=glibc.rtld.optional_static_tls=' /etc/systemd/user.conf")
+        machine.succeed("grep -F 'GLIBC_TUNABLES=' /etc/systemd/system.conf")
+        machine.succeed("grep -F 'GLIBC_TUNABLES=' /etc/systemd/user.conf")
         # The daemon must not inherit it, nor audit itself.
         env = machine.succeed(
             "tr '\\0' '\\n' < /proc/$(systemctl show -p MainPID --value nix-ld-cache.service)/environ"

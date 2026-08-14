@@ -14,16 +14,16 @@ let
   # shared group must not collide with it (that fails at step USER with
   # "User or group with specified name already exists").
   cacheGroup = "nix-ld-cache-readers";
-  auditEnvironment =
-    {
-      LD_AUDIT = "${cfg.package}/lib/libnix-ld-cache-audit.so";
-      NIX_LD_AUDIT_CACHE_DIR = cfg.cacheDir;
-      NIX_LD_AUDIT_SOCKET = cfg.socketPath;
-      GLIBC_TUNABLES = "glibc.rtld.optional_static_tls=${toString cfg.staticTlsSurplus}";
-    }
-    // lib.optionalAttrs cfg.debug {
-      NIX_LD_AUDIT_DEBUG = "1";
-    };
+  auditLibraryPath = "/run/current-system/sw/lib/nix-ld-cache.so";
+  auditEnvironment = {
+    LD_AUDIT = auditLibraryPath;
+    NIX_LD_AUDIT_CACHE_DIR = cfg.cacheDir;
+    NIX_LD_AUDIT_SOCKET = cfg.socketPath;
+    GLIBC_TUNABLES = "glibc.rtld.optional_static_tls=${toString cfg.staticTlsSurplus}";
+  }
+  // lib.optionalAttrs cfg.debug {
+    NIX_LD_AUDIT_DEBUG = "1";
+  };
   auditEnvironmentString = lib.concatStringsSep " " (
     lib.mapAttrsToList (name: value: "${name}=${lib.escapeShellArg value}") auditEnvironment
   );
@@ -115,6 +115,7 @@ in
     nix.settings = lib.mkIf cfg.nixSandboxIntegration {
       extra-sandbox-paths = [
         cfg.cacheDir
+        auditLibraryPath
         "/run/${runtimeName}"
       ];
       # Derived from auditEnvironment so no variable can be missed here: the
@@ -193,8 +194,14 @@ in
         # /proc/<pid>/environ is gated by PTRACE_MODE_READ (see environ_open in
         # fs/proc/base.c), so reading a peer's LD_LIBRARY_PATH needs
         # CAP_SYS_PTRACE in addition to CAP_DAC_READ_SEARCH.
-        CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE" ];
-        AmbientCapabilities = [ "CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE" ];
+        CapabilityBoundingSet = [
+          "CAP_DAC_READ_SEARCH"
+          "CAP_SYS_PTRACE"
+        ];
+        AmbientCapabilities = [
+          "CAP_DAC_READ_SEARCH"
+          "CAP_SYS_PTRACE"
+        ];
       };
     };
   };
