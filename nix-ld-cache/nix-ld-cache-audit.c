@@ -30,6 +30,7 @@
  * memoized scope covers every soname in that batch. */
 struct scope_cache {
   char *requester_path;
+  char *ld_library_path;
   char *file_contents;
   size_t file_len;
 };
@@ -418,10 +419,8 @@ cache_dir_path(void)
 /* Must stay byte-identical to cache_scope_key() in nix-ld-cache-daemon.c;
  * any drift silently reads a scope the daemon never writes. */
 static char *
-cache_scope_key(const char *requester_path)
+cache_scope_key(const char *requester_path, const char *ld_library_path)
 {
-  const char *ld_library_path = getenv("LD_LIBRARY_PATH");
-
   char *key = NULL;
   if (asprintf(&key,
                "v2\nrequester=%s\nld_library_path=%s\n",
@@ -434,14 +433,14 @@ cache_scope_key(const char *requester_path)
 }
 
 static char *
-cache_file_path(const char *requester_path)
+cache_file_path(const char *requester_path, const char *ld_library_path)
 {
   char *dir = cache_dir_path();
   if (dir == NULL) {
     return NULL;
   }
 
-  char *scope_key = cache_scope_key(requester_path);
+  char *scope_key = cache_scope_key(requester_path, ld_library_path);
   if (scope_key == NULL) {
     free(dir);
     return NULL;
@@ -519,24 +518,31 @@ static void
 scope_cache_reset(void)
 {
   free(cached_scope.requester_path);
+  free(cached_scope.ld_library_path);
   free(cached_scope.file_contents);
   memset(&cached_scope, 0, sizeof(cached_scope));
 }
 
-/* Loads and memoizes the scope's cache file. A process typically resolves many
- * sonames for one requester, so reading the file once per scope replaces one
- * open plus full scan per soname. Caller holds state_lock. */
+/* Loads and memoizes the scope's cache file. Missing files are not memoized:
+ * the daemon may create them after an earlier miss in the same process. */
 static bool
 scope_cache_load(const char *requester_path)
 {
+  const char *ld_library_path = getenv("LD_LIBRARY_PATH");
+  if (ld_library_path == NULL) {
+    ld_library_path = "";
+  }
+
   if (cached_scope.requester_path != NULL
-      && strcmp(cached_scope.requester_path, requester_path) == 0) {
+      && cached_scope.ld_library_path != NULL
+      && strcmp(cached_scope.requester_path, requester_path) == 0
+      && strcmp(cached_scope.ld_library_path, ld_library_path) == 0) {
     return cached_scope.file_contents != NULL;
   }
 
   scope_cache_reset();
 
-  char *cache_path = cache_file_path(requester_path);
+  char *cache_path = cache_file_path(requester_path, ld_library_path);
   if (cache_path == NULL) {
     return false;
   }
@@ -544,28 +550,27 @@ scope_cache_load(const char *requester_path)
   size_t len = 0;
   char *contents = read_whole_file(cache_path, &len);
   free(cache_path);
+  if (contents == NULL) {
+    return false;
+  }
 
   cached_scope.requester_path = xstrdup(requester_path);
-  if (cached_scope.requester_path == NULL) {
+  cached_scope.ld_library_path = xstrdup(ld_library_path);
+  if (cached_scope.requester_path == NULL || cached_scope.ld_library_path == NULL) {
     free(contents);
+    scope_cache_reset();
     return false;
   }
 
   cached_scope.file_contents = contents;
   cached_scope.file_len = len;
-  return contents != NULL;
+  return true;
 }
 
-/* Scans the memoized scope for soname. The daemon writes each (soname, path)
- * pair once, so the first match is the only match and the scan stops there.
- * Caller holds state_lock. */
+/* Scans the memoized scope for soname. Caller holds state_lock. */
 static char *
-lookup_cache_entry(const char *requester_path, const char *soname)
+scan_scope_cache(const char *soname)
 {
-  if (!scope_cache_load(requester_path)) {
-    return NULL;
-  }
-
   const char *p = cached_scope.file_contents;
   const char *end = p + cached_scope.file_len;
   size_t soname_len = strlen(soname);
@@ -593,6 +598,28 @@ lookup_cache_entry(const char *requester_path, const char *soname)
   }
 
   return NULL;
+}
+
+/* The daemon appends to scope files asynchronously, so a loaded scope can become
+ * stale after a miss. Retry once with a fresh read before falling back to glibc. */
+static char *
+lookup_cache_entry(const char *requester_path, const char *soname)
+{
+  if (!scope_cache_load(requester_path)) {
+    return NULL;
+  }
+
+  char *path = scan_scope_cache(soname);
+  if (path != NULL) {
+    return path;
+  }
+
+  scope_cache_reset();
+  if (!scope_cache_load(requester_path)) {
+    return NULL;
+  }
+
+  return scan_scope_cache(soname);
 }
 
 static int
@@ -1007,7 +1034,12 @@ commit_daemonless_cache_entry(const char *requester_path, const char *soname, co
     return -1;
   }
 
-  char *cache_path = cache_file_path(requester_path);
+  const char *ld_library_path = getenv("LD_LIBRARY_PATH");
+  if (ld_library_path == NULL) {
+    ld_library_path = "";
+  }
+
+  char *cache_path = cache_file_path(requester_path, ld_library_path);
   if (cache_path == NULL) {
     return -1;
   }
