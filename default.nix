@@ -170,8 +170,7 @@ in
         ReadWritePaths = [ cfg.cacheDir ];
         RuntimeDirectory = runtimeName;
         RuntimeDirectoryMode = "0755";
-        # One fd-table slot per connection is not enough: each also holds a
-        # /proc/<pid> dirfd and a pidfd.
+        # One client fd per connection, plus the listening socket and epoll fd.
         LimitNOFILE = 4096;
         PermissionsStartOnly = false;
         NoNewPrivileges = true;
@@ -191,17 +190,7 @@ in
         RestrictNamespaces = true;
         SystemCallArchitectures = "native";
         RestrictAddressFamilies = [ "AF_UNIX" ];
-        # /proc/<pid>/environ is gated by PTRACE_MODE_READ (see environ_open in
-        # fs/proc/base.c), so reading a peer's LD_LIBRARY_PATH needs
-        # CAP_SYS_PTRACE in addition to CAP_DAC_READ_SEARCH.
-        CapabilityBoundingSet = [
-          "CAP_DAC_READ_SEARCH"
-          "CAP_SYS_PTRACE"
-        ];
-        AmbientCapabilities = [
-          "CAP_DAC_READ_SEARCH"
-          "CAP_SYS_PTRACE"
-        ];
+        CapabilityBoundingSet = [ "" ];
       };
     };
   };

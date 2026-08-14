@@ -29,10 +29,6 @@
 /* Sentinel in epoll_event.data.u32, which otherwise carries a slot index. */
 #define LISTEN_SLOT UINT32_MAX
 
-#ifndef SO_PEERPIDFD
-#define SO_PEERPIDFD 77
-#endif
-
 static volatile sig_atomic_t stop_requested;
 static bool debug_logging;
 
@@ -43,14 +39,11 @@ enum conn_state {
 
 struct connection {
   int fd;
-  int proc_fd;
-  int pidfd;
   pid_t pid;
   enum conn_state state;
   uint64_t deadline_ms;
   struct nix_ld_cache_msg header;
   size_t header_got;
-  char *ld_library_path;
   char *payload;
   size_t payload_cap;
   size_t wire_len;
@@ -598,78 +591,6 @@ first_hit_in_search_path(const char *search_path, const char *soname)
   return NULL;
 }
 
-static char *
-proc_read_file_at(int proc_fd, const char *name, size_t *size_out)
-{
-  int fd = openat(proc_fd, name, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return NULL;
-  }
-
-  size_t cap = 4096;
-  size_t len = 0;
-  char *buf = malloc(cap);
-  if (buf == NULL) {
-    close(fd);
-    return NULL;
-  }
-
-  while (true) {
-    if (len == cap) {
-      size_t next_cap = cap * 2;
-      if (next_cap > (1u << 20)) {
-        break;
-      }
-      char *next = realloc(buf, next_cap);
-      if (next == NULL) {
-        free(buf);
-        close(fd);
-        return NULL;
-      }
-      buf = next;
-      cap = next_cap;
-    }
-
-    ssize_t rc = read(fd, buf + len, cap - len);
-    if (rc < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      free(buf);
-      close(fd);
-      return NULL;
-    }
-    if (rc == 0) {
-      break;
-    }
-    len += (size_t) rc;
-  }
-
-  close(fd);
-  if (size_out != NULL) {
-    *size_out = len;
-  }
-  return buf;
-}
-
-static const char *
-find_env_value(const char *envbuf, size_t envlen, const char *name)
-{
-  size_t namelen = strlen(name);
-  const char *p = envbuf;
-  const char *end = envbuf + envlen;
-
-  while (p < end && *p != '\0') {
-    size_t len = strnlen(p, (size_t) (end - p));
-    if (len > namelen && memcmp(p, name, namelen) == 0 && p[namelen] == '=') {
-      return p + namelen + 1;
-    }
-    p += len + 1;
-  }
-
-  return NULL;
-}
-
 /* Must stay byte-identical to cache_scope_key() in nix-ld-cache-audit.c. */
 static char *
 cache_scope_key(const char *requester_path, const char *ld_library_path)
@@ -775,25 +696,8 @@ commit_cache_entry(const char *cache_dir, const char *requester_path,
   free(cache_path);
 }
 
-/* Confirms the loader's own answer instead of recomputing it.
- *
- * glibc searches, in order: the DT_RPATH chain, LD_LIBRARY_PATH, the
- * requester's DT_RUNPATH, ld.so.cache, then the default directories. Only a
- * prefix of that is reconstructible from immutable data, so this accepts a
- * claim only when the outcome is unambiguous:
- *
- *   - the requester has DT_RUNPATH, which per _dl_map_new_object suppresses the
- *     entire DT_RPATH chain (including inherited and executable RPATH);
- *   - every LD_LIBRARY_PATH and DT_RUNPATH entry is a token-free store path;
- *   - the claimed path is the first hit walking LD_LIBRARY_PATH then DT_RUNPATH,
- *     so no earlier directory could have won.
- *
- * A hit implies glibc never consulted ld.so.cache or the default directories,
- * neither of which is captured by the cache key. Anything else is refused
- * rather than guessed. */
 /* Derives the resolution instead of checking a client's claim. The client sends
- * only {requester, soname}; everything below is read by the daemon under its own
- * root, so nothing the client says can steer the answer.
+ * the requester, soname and LD_LIBRARY_PATH scope, but not the resolved path.
  *
  * glibc searches, in order: the DT_RPATH chain, LD_LIBRARY_PATH, the
  * requester's DT_RUNPATH, ld.so.cache, then the default directories. Only a
@@ -884,89 +788,27 @@ out:
   return hit;
 }
 
-/* pidfd_send_signal() would need CAP_KILL to probe a process owned by another
- * user, which the unit deliberately does not hold. The pidfd's fdinfo reports
- * Pid: -1 once the process is reaped, and reading it needs no capability. */
-static bool
-peer_still_alive(const struct connection *conn)
-{
-  /* No pidfd means SO_PEERPIDFD was unavailable (pre-6.5). Fail closed: without
-   * it the pid may already have been recycled, so the environment just read
-   * could belong to an unrelated process and key the entry into a scope the
-   * peer does not control. */
-  if (conn->pidfd < 0) {
-    return false;
-  }
-
-  char path[64];
-  snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", conn->pidfd);
-
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return false;
-  }
-
-  char buf[512];
-  ssize_t len = read(fd, buf, sizeof(buf) - 1);
-  close(fd);
-  if (len <= 0) {
-    return false;
-  }
-  buf[len] = '\0';
-
-  const char *pid_line = strstr(buf, "Pid:");
-  if (pid_line == NULL) {
-    return false;
-  }
-
-  long pid = strtol(pid_line + 4, NULL, 10);
-  return pid == (long) conn->pid;
-}
-
-/* Snapshots LD_LIBRARY_PATH at accept time. Clients are fire-and-forget and
- * routinely exit before their message is processed, so reading /proc later
- * would fail for legitimate submissions; reading it now also closes the pid
- * recycling window, since a live pidfd here proves the pid still belongs to
- * the peer that connected. */
-static bool
-capture_peer_environment(struct connection *conn)
-{
-  size_t envlen = 0;
-  char *envbuf = proc_read_file_at(conn->proc_fd, "environ", &envlen);
-  if (envbuf == NULL) {
-    return false;
-  }
-
-  const char *value = find_env_value(envbuf, envlen, "LD_LIBRARY_PATH");
-  conn->ld_library_path = xstrdup(value != NULL ? value : "");
-  free(envbuf);
-
-  if (conn->ld_library_path == NULL) {
-    return false;
-  }
-
-  /* If the peer died mid-read the environ snapshot may be from a recycled pid. */
-  return peer_still_alive(conn);
-}
-
 static void
 process_message(struct connection *conn, const char *cache_dir)
 {
   const char *requester_path = conn->payload;
   const char *soname = requester_path + conn->header.requester_len + 1;
+  const char *ld_library_path = soname + conn->header.soname_len + 1;
 
-  if (!path_is_safe_store_path(requester_path) || !field_is_safe_soname(soname)) {
+  if (!path_is_safe_store_path(requester_path)
+      || !field_is_safe_soname(soname)
+      || (ld_library_path[0] != '\0' && !search_path_is_cacheable(ld_library_path))) {
     debugf("reject reason=invalid-fields pid=%ld", (long) conn->pid);
     return;
   }
 
-  char *resolved = derive_resolution(requester_path, soname, conn->ld_library_path);
+  char *resolved = derive_resolution(requester_path, soname, ld_library_path);
   if (resolved == NULL) {
     return;
   }
 
   debugf("commit requester=%s soname=%s path=%s", requester_path, soname, resolved);
-  commit_cache_entry(cache_dir, requester_path, conn->ld_library_path, soname, resolved);
+  commit_cache_entry(cache_dir, requester_path, ld_library_path, soname, resolved);
   free(resolved);
 }
 
@@ -976,18 +818,9 @@ connection_close(struct connection *conn)
   if (conn->fd >= 0) {
     close(conn->fd);
   }
-  if (conn->proc_fd >= 0) {
-    close(conn->proc_fd);
-  }
-  if (conn->pidfd >= 0) {
-    close(conn->pidfd);
-  }
-  free(conn->ld_library_path);
   free(conn->payload);
   memset(conn, 0, sizeof(*conn));
   conn->fd = -1;
-  conn->proc_fd = -1;
-  conn->pidfd = -1;
 }
 
 static bool
@@ -996,21 +829,25 @@ header_is_sane(const struct nix_ld_cache_msg *msg)
   return msg->magic == NIX_LD_CACHE_PROTOCOL_MAGIC
     && msg->version == NIX_LD_CACHE_PROTOCOL_VERSION
     && msg->requester_len > 0 && msg->requester_len <= NIX_LD_CACHE_PROTOCOL_MAX_FIELD
-    && msg->soname_len > 0 && msg->soname_len <= NIX_LD_CACHE_PROTOCOL_MAX_FIELD;
+    && msg->soname_len > 0 && msg->soname_len <= NIX_LD_CACHE_PROTOCOL_MAX_FIELD
+    && msg->ld_library_path_len <= NIX_LD_CACHE_PROTOCOL_MAX_FIELD;
 }
 
-/* Turns the contiguous wire payload into two NUL-terminated fields in place,
+/* Turns the contiguous wire payload into three NUL-terminated fields in place,
  * shifting from the right so nothing is overwritten before it is moved. */
 static void
 terminate_payload_fields(struct connection *conn)
 {
   size_t rlen = conn->header.requester_len;
   size_t slen = conn->header.soname_len;
+  size_t llen = conn->header.ld_library_path_len;
   char *buf = conn->payload;
 
-  memmove(buf + rlen + 1, buf + rlen, slen);
+  memmove(buf + rlen + 1, buf + rlen, slen + llen);
+  memmove(buf + rlen + 1 + slen + 1, buf + rlen + 1 + slen, llen);
   buf[rlen] = '\0';
   buf[rlen + 1 + slen] = '\0';
+  buf[rlen + 1 + slen + 1 + llen] = '\0';
 }
 
 /* Returns false when the connection is finished and should be dropped. */
@@ -1037,8 +874,10 @@ connection_read(struct connection *conn, const char *cache_dir)
         return false;
       }
 
-      conn->wire_len = (size_t) conn->header.requester_len + conn->header.soname_len;
-      conn->payload_cap = conn->wire_len + 2;
+      conn->wire_len = (size_t) conn->header.requester_len
+        + conn->header.soname_len
+        + conn->header.ld_library_path_len;
+      conn->payload_cap = conn->wire_len + 3;
       conn->payload = calloc(1, conn->payload_cap);
       if (conn->payload == NULL) {
         return false;
@@ -1142,26 +981,6 @@ accept_connections(int listen_fd, int epoll_fd, struct connection *conns, size_t
       continue;
     }
     conn->pid = cred.pid;
-
-    socklen_t pidfd_len = sizeof(conn->pidfd);
-    if (getsockopt(client, SOL_SOCKET, SO_PEERPIDFD, &conn->pidfd, &pidfd_len) != 0) {
-      conn->pidfd = -1;
-    }
-
-    char proc_path[64];
-    snprintf(proc_path, sizeof(proc_path), "/proc/%ld", (long) cred.pid);
-    conn->proc_fd = open(proc_path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-    if (conn->proc_fd < 0) {
-      connection_close(conn);
-      continue;
-    }
-
-    if (!capture_peer_environment(conn)) {
-      debugf("reject reason=no-environ pid=%ld errno=%d (%s)",
-             (long) cred.pid, errno, strerror(errno));
-      connection_close(conn);
-      continue;
-    }
 
     /* epoll carries the slot index, since the fd no longer implies it. */
     struct epoll_event ev = {
@@ -1275,8 +1094,6 @@ main(int argc, char **argv)
   }
   for (size_t i = 0; i < MAX_CONNECTIONS; ++i) {
     conns[i].fd = -1;
-    conns[i].proc_fd = -1;
-    conns[i].pidfd = -1;
   }
 
   size_t live_count = 0;

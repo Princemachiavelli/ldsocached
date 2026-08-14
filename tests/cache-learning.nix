@@ -141,16 +141,16 @@ let
   };
 
   # Submits a resolution request as an unprivileged user. The protocol carries
-  # only {requester, soname}, so a client cannot name a path at all -- this
-  # exercises that the daemon derives the answer regardless of who asks.
+  # the cache scope and soname, but no resolved path; this exercises that the
+  # daemon derives the answer regardless of who asks.
   forgeClaim = pkgs.writers.writePython3Bin "ldsocached-forge-claim" { } ''
     import socket
     import struct
     import sys
 
     requester, soname = sys.argv[1:3]
-    fields = [x.encode() for x in (requester, soname)]
-    header = struct.pack("<IIII", 0x4E4C4348, 2, *[len(x) for x in fields])
+    fields = [x.encode() for x in (requester, soname, "")]
+    header = struct.pack("<IIIII", 0x4E4C4348, 3, *[len(x) for x in fields])
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect("/run/nix-ld-cache/learn.sock")
@@ -313,6 +313,30 @@ in
         machine.fail(
             "grep -R --fixed-strings '/tmp/mylibs/libdemo.so' /var/cache/nix-ld-cache"
         )
+
+    with subtest("a store LD_LIBRARY_PATH scope is learned and replayed"):
+        machine.succeed("rm -f /var/cache/nix-ld-cache/*.tsv")
+        out = machine.succeed(
+            "su alice -c 'LD_LIBRARY_PATH=${evilLib}/lib NIX_LD_AUDIT_DEBUG=1 "
+            "${demoApp}/bin/demo-app' 2>&1"
+        )
+        assert "demo-666" in out, f"expected LD_LIBRARY_PATH to override RUNPATH, got: {out}"
+        assert (
+            "cache miss requester=${demoApp}/bin/demo-app soname=libdemo.so" in out
+        ), f"expected first scoped lookup to miss, got: {out}"
+        machine.wait_until_succeeds(
+            "grep -R --fixed-strings '${evilLib}/lib/libdemo.so' /var/cache/nix-ld-cache"
+        )
+        out = machine.succeed(
+            "su alice -c 'LD_LIBRARY_PATH=${evilLib}/lib NIX_LD_AUDIT_DEBUG=1 "
+            "${demoApp}/bin/demo-app' 2>&1"
+        )
+        assert (
+            "cache hit requester=${demoApp}/bin/demo-app soname=libdemo.so "
+            "path=${evilLib}/lib/libdemo.so"
+            in out
+        ), f"expected second scoped lookup to hit, got: {out}"
+        assert "demo-666" in out, f"expected the scoped path to replay, got: {out}"
 
     with subtest("a /run requester symlink is keyed by its store target"):
         machine.succeed("rm -f /var/cache/nix-ld-cache/*.tsv")

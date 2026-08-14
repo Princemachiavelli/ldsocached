@@ -1142,6 +1142,20 @@ submit_cache_entry(uintptr_t cookie_value, const char *requester_path, const cha
     return 0;
   }
 
+  const char *ld_library_path = getenv("LD_LIBRARY_PATH");
+  if (ld_library_path == NULL) {
+    ld_library_path = "";
+  }
+
+  size_t requester_len = strlen(requester_path);
+  size_t soname_len = strlen(soname);
+  size_t ld_library_path_len = strlen(ld_library_path);
+  if (requester_len > NIX_LD_CACHE_PROTOCOL_MAX_FIELD
+      || soname_len > NIX_LD_CACHE_PROTOCOL_MAX_FIELD
+      || ld_library_path_len > NIX_LD_CACHE_PROTOCOL_MAX_FIELD) {
+    return 0;
+  }
+
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
   if (fd < 0) {
     return -1;
@@ -1169,7 +1183,7 @@ submit_cache_entry(uintptr_t cookie_value, const char *requester_path, const cha
     int rc = poll(&pfd, 1, 200);
     if (rc <= 0) {
       close(fd);
-      errno = ETIMEDOUT;
+      errno = rc == 0 ? ETIMEDOUT : errno;
       return -1;
     }
 
@@ -1188,13 +1202,15 @@ submit_cache_entry(uintptr_t cookie_value, const char *requester_path, const cha
   struct nix_ld_cache_msg msg = {
     .magic = NIX_LD_CACHE_PROTOCOL_MAGIC,
     .version = NIX_LD_CACHE_PROTOCOL_VERSION,
-    .requester_len = (uint32_t) strlen(requester_path),
-    .soname_len = (uint32_t) strlen(soname),
+    .requester_len = (uint32_t) requester_len,
+    .soname_len = (uint32_t) soname_len,
+    .ld_library_path_len = (uint32_t) ld_library_path_len,
   };
 
   int rc = send_full(fd, &msg, sizeof(msg));
   rc = rc == 0 ? send_full(fd, requester_path, msg.requester_len) : rc;
   rc = rc == 0 ? send_full(fd, soname, msg.soname_len) : rc;
+  rc = rc == 0 ? send_full(fd, ld_library_path, msg.ld_library_path_len) : rc;
   close(fd);
   return rc;
 }
