@@ -165,7 +165,7 @@ in
         # Group membership, not CacheDirectory=, is what grants write access to
         # the tmpfiles-managed shared cache; ProtectSystem=strict makes /var
         # read-only, so the path must be listed explicitly.
-        SupplementalGroups = [ cacheGroup ];
+        SupplementaryGroups = [ cacheGroup ];
         ReadWritePaths = [ cfg.cacheDir ];
         RuntimeDirectory = runtimeName;
         RuntimeDirectoryMode = "0755";
