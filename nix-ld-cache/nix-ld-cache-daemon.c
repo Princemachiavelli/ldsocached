@@ -453,18 +453,6 @@ parse_dynamic_info(const struct elf_image *image, struct dynamic_info *info)
 }
 
 static bool
-dynamic_info_needs(const struct dynamic_info *info, const char *soname)
-{
-  for (size_t i = 0; i < info->needed_count; ++i) {
-    if (strcmp(info->needed[i], soname) == 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-static bool
 soname_matches(const char *path, const char *soname)
 {
   struct elf_image image;
@@ -699,10 +687,10 @@ commit_cache_entry(const char *cache_dir, const char *requester_path,
 /* Derives the resolution instead of checking a client's claim. The client sends
  * the requester, soname and LD_LIBRARY_PATH scope, but not the resolved path.
  *
- * glibc searches, in order: the DT_RPATH chain, LD_LIBRARY_PATH, the
- * requester's DT_RUNPATH, ld.so.cache, then the default directories. Only a
- * prefix of that is reconstructible from immutable data, so a resolution is
- * derived only when the outcome is unambiguous:
+ * glibc searches no-slash DT_NEEDED and dlopen names through the DT_RPATH
+ * chain, LD_LIBRARY_PATH, the requester's DT_RUNPATH, ld.so.cache, then the
+ * default directories. Only a prefix of that is reconstructible from immutable
+ * data, so a resolution is derived only when the outcome is unambiguous:
  *
  *   - the requester has DT_RUNPATH, which per _dl_map_new_object (glibc
  *     elf/dl-load.c, `loader->l_info[DT_RUNPATH] == NULL` gate) suppresses the
@@ -732,11 +720,6 @@ derive_resolution(const char *requester_path, const char *soname,
   }
 
   char *hit = NULL;
-
-  if (!dynamic_info_needs(&info, soname)) {
-    debugf("reject reason=not-needed requester=%s soname=%s", requester_path, soname);
-    goto out;
-  }
 
   if (!info.has_runpath) {
     debugf("reject reason=no-runpath requester=%s soname=%s", requester_path, soname);

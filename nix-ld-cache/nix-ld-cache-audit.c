@@ -271,18 +271,6 @@ free_dynamic_info(struct dynamic_info *info)
 }
 
 static bool
-dynamic_info_needs(const struct dynamic_info *info, const char *soname)
-{
-  for (size_t i = 0; i < info->needed_count; ++i) {
-    if (strcmp(info->needed[i], soname) == 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-static bool
 parse_mapped_dynamic_info(uintptr_t cookie_value, struct dynamic_info *info)
 {
   memset(info, 0, sizeof(*info));
@@ -934,11 +922,6 @@ derive_resolution(uintptr_t cookie_value, const char *requester_path, const char
 
   char *hit = NULL;
   const char *ld_library_path = getenv("LD_LIBRARY_PATH");
-
-  if (!dynamic_info_needs(&info, soname)) {
-    debugf("daemonless reject reason=not-needed requester=%s soname=%s", requester_path, soname);
-    goto out;
-  }
 
   if (!info.has_runpath) {
     debugf("daemonless reject reason=no-runpath requester=%s soname=%s", requester_path, soname);

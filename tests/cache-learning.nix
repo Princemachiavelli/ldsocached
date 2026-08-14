@@ -82,6 +82,70 @@ let
     '';
   };
 
+  runtimeLib = pkgs.stdenv.mkDerivation {
+    pname = "ldsocached-runtime-lib";
+    version = "0.1.0";
+
+    dontUnpack = true;
+    dontConfigure = true;
+
+    buildPhase = ''
+      cat > runtime-lib.c <<'EOF'
+      int runtime_value(void) {
+        return 42;
+      }
+      EOF
+
+      $CC -fPIC -shared -Wl,-soname,libruntime.so -o libruntime.so runtime-lib.c
+    '';
+
+    installPhase = ''
+      mkdir -p $out/lib
+      cp libruntime.so $out/lib/
+    '';
+  };
+
+  dlopenApp = pkgs.stdenv.mkDerivation {
+    pname = "ldsocached-dlopen-app";
+    version = "0.1.0";
+
+    dontUnpack = true;
+    dontConfigure = true;
+
+    buildPhase = ''
+      cat > dlopen-app.c <<'EOF'
+      #include <dlfcn.h>
+      #include <stdio.h>
+
+      int main(void) {
+        void *handle = dlopen("libruntime.so", RTLD_NOW);
+        if (handle == NULL) {
+          fprintf(stderr, "dlopen: %s\n", dlerror());
+          return 1;
+        }
+
+        int (*runtime_value)(void) = dlsym(handle, "runtime_value");
+        if (runtime_value == NULL) {
+          fprintf(stderr, "dlsym: %s\n", dlerror());
+          return 1;
+        }
+
+        printf("runtime-%d\n", runtime_value());
+        fflush(stdout);
+        return 0;
+      }
+      EOF
+
+      $CC -o dlopen-app dlopen-app.c -ldl \
+        -Wl,-rpath,${runtimeLib}/lib -Wl,--enable-new-dtags
+    '';
+
+    installPhase = ''
+      mkdir -p $out/bin
+      cp dlopen-app $out/bin/
+    '';
+  };
+
   runRequesterLib = pkgs.stdenv.mkDerivation {
     pname = "ldsocached-run-requester-lib";
     version = "0.1.0";
@@ -215,6 +279,7 @@ in
       environment.systemPackages = [
         package
         demoApp
+        dlopenApp
         runRequesterApp
         forgeClaim
         stallClients
@@ -294,12 +359,12 @@ in
         )
         machine.wait_until_succeeds("journalctl -u nix-ld-cache -g invalid-fields")
 
-    with subtest("a soname the requester does not need is refused"):
+    with subtest("an unavailable soname is refused"):
         machine.succeed(
             "su alice -c '${forgeClaim}/bin/ldsocached-forge-claim "
             "${demoApp}/bin/demo-app libnotneeded.so.1'"
         )
-        machine.wait_until_succeeds("journalctl -u nix-ld-cache -g reason=not-needed")
+        machine.wait_until_succeeds("journalctl -u nix-ld-cache -g reason=no-hit-in-search-paths")
 
     with subtest("a non-store LD_LIBRARY_PATH entry disables caching"):
         machine.succeed("mkdir -p /tmp/mylibs")
@@ -337,6 +402,30 @@ in
             in out
         ), f"expected second scoped lookup to hit, got: {out}"
         assert "demo-666" in out, f"expected the scoped path to replay, got: {out}"
+
+    with subtest("a store LD_LIBRARY_PATH dlopen target is learned and replayed"):
+        machine.succeed("rm -f /var/cache/nix-ld-cache/*.tsv")
+        out = machine.succeed(
+            "su alice -c 'LD_LIBRARY_PATH=${runtimeLib}/lib NIX_LD_AUDIT_DEBUG=1 "
+            "${dlopenApp}/bin/dlopen-app' 2>&1"
+        )
+        assert "runtime-42" in out, f"expected dlopen program to work, got: {out}"
+        assert (
+            "cache miss requester=${dlopenApp}/bin/dlopen-app soname=libruntime.so" in out
+        ), f"expected first runtime lookup to miss, got: {out}"
+        machine.wait_until_succeeds(
+            "grep -R --fixed-strings '${runtimeLib}/lib/libruntime.so' /var/cache/nix-ld-cache"
+        )
+        out = machine.succeed(
+            "su alice -c 'LD_LIBRARY_PATH=${runtimeLib}/lib NIX_LD_AUDIT_DEBUG=1 "
+            "${dlopenApp}/bin/dlopen-app' 2>&1"
+        )
+        assert (
+            "cache hit requester=${dlopenApp}/bin/dlopen-app soname=libruntime.so "
+            "path=${runtimeLib}/lib/libruntime.so"
+            in out
+        ), f"expected runtime lookup to hit, got: {out}"
+        assert "runtime-42" in out, f"expected cached dlopen program to work, got: {out}"
 
     with subtest("a /run requester symlink is keyed by its store target"):
         machine.succeed("rm -f /var/cache/nix-ld-cache/*.tsv")
