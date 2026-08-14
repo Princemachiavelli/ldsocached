@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -20,6 +22,8 @@
 
 #include "protocol.h"
 
+#define STORE_PREFIX "/nix/store/"
+
 /* One cached file per requester scope. glibc holds dl_load_lock across an entire
  * DT_NEEDED search, so a process resolves one requester at a time and a single
  * memoized scope covers every soname in that batch. */
@@ -27,6 +31,22 @@ struct scope_cache {
   char *requester_path;
   char *file_contents;
   size_t file_len;
+};
+
+struct elf_image {
+  void *data;
+  size_t size;
+};
+
+struct dynamic_info {
+  const char *strtab;
+  size_t strtab_size;
+  const char *soname;
+  const char *runpath;
+  bool has_rpath;
+  bool has_runpath;
+  const char **needed;
+  size_t needed_count;
 };
 
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -100,9 +120,44 @@ path_is_absolute(const char *path)
 }
 
 static bool
-path_is_store_path(const char *path)
+path_is_safe_store_path(const char *path)
 {
-  return path != NULL && strncmp(path, "/nix/store/", strlen("/nix/store/")) == 0;
+  if (path == NULL || strncmp(path, STORE_PREFIX, strlen(STORE_PREFIX)) != 0) {
+    return false;
+  }
+
+  if (strchr(path, '\n') != NULL || strchr(path, '\t') != NULL) {
+    return false;
+  }
+
+  const char *p = path;
+  while (*p != '\0') {
+    while (*p == '/') {
+      ++p;
+    }
+    if (*p == '\0') {
+      break;
+    }
+
+    const char *end = strchrnul(p, '/');
+    size_t len = (size_t) (end - p);
+    if ((len == 1 && p[0] == '.') || (len == 2 && p[0] == '.' && p[1] == '.')) {
+      return false;
+    }
+    p = end;
+  }
+
+  return true;
+}
+
+static bool
+field_is_safe_soname(const char *soname)
+{
+  return soname != NULL
+    && soname[0] != '\0'
+    && strchr(soname, '/') == NULL
+    && strchr(soname, '\n') == NULL
+    && strchr(soname, '\t') == NULL;
 }
 
 /* Mirrors search_path_is_cacheable() in the daemon: only immutable, token-free
@@ -128,7 +183,7 @@ search_path_is_cacheable(const char *search_path)
       return false;
     }
 
-    bool ok = strchr(dir, '$') == NULL && path_is_store_path(dir);
+    bool ok = strchr(dir, '$') == NULL && path_is_safe_store_path(dir);
     free(dir);
     if (!ok) {
       return false;
@@ -184,48 +239,124 @@ requester_identity(uintptr_t cookie_value)
   return readlink_dup("/proc/self/exe");
 }
 
+static void
+free_dynamic_info(struct dynamic_info *info)
+{
+  free(info->needed);
+  memset(info, 0, sizeof(*info));
+}
+
+static bool
+dynamic_info_needs(const struct dynamic_info *info, const char *soname)
+{
+  for (size_t i = 0; i < info->needed_count; ++i) {
+    if (strcmp(info->needed[i], soname) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool
+parse_mapped_dynamic_info(uintptr_t cookie_value, struct dynamic_info *info)
+{
+  memset(info, 0, sizeof(*info));
+
+  const struct link_map *map = (const struct link_map *) cookie_value;
+  if (map == NULL || map->l_ld == NULL) {
+    return false;
+  }
+
+  ElfW(Xword) soname_off = 0;
+  ElfW(Xword) runpath_off = 0;
+  bool have_soname = false;
+  size_t needed_cap = 0;
+
+  for (const ElfW(Dyn) *dyn = map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
+    switch (dyn->d_tag) {
+      case DT_STRTAB:
+        info->strtab = (const char *) dyn->d_un.d_ptr;
+        break;
+      case DT_STRSZ:
+        info->strtab_size = (size_t) dyn->d_un.d_val;
+        break;
+      case DT_SONAME:
+        soname_off = dyn->d_un.d_val;
+        have_soname = true;
+        break;
+      case DT_RUNPATH:
+        runpath_off = dyn->d_un.d_val;
+        info->has_runpath = true;
+        break;
+      case DT_RPATH:
+        info->has_rpath = true;
+        break;
+      case DT_NEEDED:
+        if (info->needed_count == needed_cap) {
+          size_t next_cap = needed_cap == 0 ? 8 : needed_cap * 2;
+          const char **needed = realloc(info->needed, next_cap * sizeof(*needed));
+          if (needed == NULL) {
+            free_dynamic_info(info);
+            return false;
+          }
+          info->needed = needed;
+          needed_cap = next_cap;
+        }
+        info->needed[info->needed_count++] = (const char *) (uintptr_t) dyn->d_un.d_val;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (info->strtab == NULL || info->strtab_size == 0 || (uintptr_t) info->strtab < 0x1000) {
+    free_dynamic_info(info);
+    return false;
+  }
+
+  if (info->strtab[info->strtab_size - 1] != '\0') {
+    free_dynamic_info(info);
+    return false;
+  }
+
+  if (have_soname && soname_off < info->strtab_size) {
+    info->soname = info->strtab + soname_off;
+  }
+  if (info->has_runpath) {
+    if (runpath_off >= info->strtab_size) {
+      free_dynamic_info(info);
+      return false;
+    }
+    info->runpath = info->strtab + runpath_off;
+  }
+
+  for (size_t i = 0; i < info->needed_count; ++i) {
+    ElfW(Xword) off = (ElfW(Xword)) (uintptr_t) info->needed[i];
+    if (off >= info->strtab_size) {
+      free_dynamic_info(info);
+      return false;
+    }
+    info->needed[i] = info->strtab + off;
+  }
+
+  return true;
+}
+
 /* Mirrors the daemon's predicate: DT_RUNPATH must be present (which suppresses
  * the DT_RPATH chain in glibc), DT_RPATH must be absent, and every RUNPATH
  * entry must be a token-free store path. Anything else is not cacheable. */
 static bool
 requester_runpath_cacheable(uintptr_t cookie_value)
 {
-  const struct link_map *map = (const struct link_map *) cookie_value;
-  if (map == NULL || map->l_ld == NULL) {
+  struct dynamic_info info;
+  if (!parse_mapped_dynamic_info(cookie_value, &info)) {
     return false;
   }
 
-  const char *strtab = NULL;
-  ElfW(Word) runpath_off = 0;
-  size_t strsz = 0;
-  bool have_runpath = false;
-  bool have_rpath = false;
-
-  for (const ElfW(Dyn) *dyn = map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
-    if (dyn->d_tag == DT_STRTAB) {
-      strtab = (const char *) dyn->d_un.d_ptr;
-    } else if (dyn->d_tag == DT_STRSZ) {
-      strsz = (size_t) dyn->d_un.d_val;
-    } else if (dyn->d_tag == DT_RUNPATH) {
-      runpath_off = dyn->d_un.d_val;
-      have_runpath = true;
-    } else if (dyn->d_tag == DT_RPATH) {
-      have_rpath = true;
-    }
-  }
-
-  if (!have_runpath || have_rpath || strtab == NULL || runpath_off >= strsz) {
-    return false;
-  }
-
-  /* glibc relocates DT_STRTAB's d_un.d_ptr in place, so it should already be a
-   * mapped address; a non-absolute-looking pointer means that assumption broke
-   * and the table must not be dereferenced. */
-  if ((uintptr_t) strtab < 0x1000) {
-    return false;
-  }
-
-  return search_path_is_cacheable(strtab + runpath_off);
+  bool ok = info.has_runpath && !info.has_rpath && search_path_is_cacheable(info.runpath);
+  free_dynamic_info(&info);
+  return ok;
 }
 
 static char *
@@ -441,6 +572,484 @@ lookup_cache_entry(const char *requester_path, const char *soname)
   return NULL;
 }
 
+static int
+mkdir_p(const char *path)
+{
+  char *copy = xstrdup(path);
+  if (copy == NULL) {
+    return -1;
+  }
+
+  for (char *p = copy + 1; *p != '\0'; ++p) {
+    if (*p != '/') {
+      continue;
+    }
+
+    *p = '\0';
+    if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
+      int err = errno;
+      free(copy);
+      errno = err;
+      return -1;
+    }
+    *p = '/';
+  }
+
+  if (mkdir(copy, 0755) != 0 && errno != EEXIST) {
+    int err = errno;
+    free(copy);
+    errno = err;
+    return -1;
+  }
+
+  free(copy);
+  return 0;
+}
+
+static int
+write_full(int fd, const void *buf, size_t len)
+{
+  const char *p = buf;
+  size_t offset = 0;
+
+  while (offset < len) {
+    ssize_t rc = write(fd, p + offset, len - offset);
+    if (rc < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    offset += (size_t) rc;
+  }
+
+  return 0;
+}
+
+static void
+unload_elf_image(struct elf_image *image)
+{
+  if (image->data != NULL) {
+    munmap(image->data, image->size);
+  }
+  image->data = NULL;
+  image->size = 0;
+}
+
+static bool
+load_elf_image(const char *path, struct elf_image *image)
+{
+  memset(image, 0, sizeof(*image));
+
+  char *resolved = realpath(path, NULL);
+  if (resolved == NULL) {
+    return false;
+  }
+  bool safe = path_is_safe_store_path(resolved);
+  free(resolved);
+  if (!safe) {
+    return false;
+  }
+
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < (off_t) sizeof(Elf64_Ehdr)) {
+    close(fd);
+    return false;
+  }
+
+  void *data = mmap(NULL, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (data == MAP_FAILED) {
+    return false;
+  }
+
+  image->data = data;
+  image->size = (size_t) st.st_size;
+  return true;
+}
+
+static bool
+elf_bounds_ok(const struct elf_image *image, size_t off, size_t size)
+{
+  return off <= image->size && size <= image->size - off;
+}
+
+static bool
+vaddr_to_offset(const struct elf_image *image, const Elf64_Phdr *phdrs, size_t phnum,
+                Elf64_Addr vaddr, size_t *offset_out)
+{
+  for (size_t i = 0; i < phnum; ++i) {
+    const Elf64_Phdr *ph = &phdrs[i];
+    if (ph->p_type != PT_LOAD) {
+      continue;
+    }
+    if (vaddr < ph->p_vaddr || vaddr >= ph->p_vaddr + ph->p_memsz) {
+      continue;
+    }
+
+    size_t delta = (size_t) (vaddr - ph->p_vaddr);
+    if (delta > ph->p_filesz || ph->p_offset > SIZE_MAX - delta) {
+      return false;
+    }
+    if (!elf_bounds_ok(image, (size_t) ph->p_offset + delta, 1)) {
+      return false;
+    }
+    *offset_out = (size_t) ph->p_offset + delta;
+    return true;
+  }
+
+  return false;
+}
+
+static bool
+parse_file_dynamic_info(const struct elf_image *image, struct dynamic_info *info)
+{
+  memset(info, 0, sizeof(*info));
+
+  if (!elf_bounds_ok(image, 0, sizeof(Elf64_Ehdr))) {
+    return false;
+  }
+
+  const Elf64_Ehdr *ehdr = image->data;
+  if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0
+      || ehdr->e_ident[EI_CLASS] != ELFCLASS64
+      || ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
+    return false;
+  }
+
+  if (!elf_bounds_ok(image, ehdr->e_phoff, ehdr->e_phnum * sizeof(Elf64_Phdr))) {
+    return false;
+  }
+
+  const Elf64_Phdr *phdrs = (const Elf64_Phdr *) ((const char *) image->data + ehdr->e_phoff);
+  const Elf64_Dyn *dynamic = NULL;
+  size_t dynamic_count = 0;
+
+  for (size_t i = 0; i < ehdr->e_phnum; ++i) {
+    if (phdrs[i].p_type != PT_DYNAMIC) {
+      continue;
+    }
+    if (!elf_bounds_ok(image, phdrs[i].p_offset, phdrs[i].p_filesz)) {
+      return false;
+    }
+    dynamic = (const Elf64_Dyn *) ((const char *) image->data + phdrs[i].p_offset);
+    dynamic_count = phdrs[i].p_filesz / sizeof(Elf64_Dyn);
+    break;
+  }
+
+  if (dynamic == NULL) {
+    return false;
+  }
+
+  Elf64_Addr strtab_vaddr = 0;
+  Elf64_Xword soname_off = 0;
+  bool have_soname = false;
+
+  for (size_t i = 0; i < dynamic_count && dynamic[i].d_tag != DT_NULL; ++i) {
+    switch (dynamic[i].d_tag) {
+      case DT_STRTAB:
+        strtab_vaddr = dynamic[i].d_un.d_ptr;
+        break;
+      case DT_STRSZ:
+        info->strtab_size = (size_t) dynamic[i].d_un.d_val;
+        break;
+      case DT_SONAME:
+        soname_off = dynamic[i].d_un.d_val;
+        have_soname = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  size_t strtab_off = 0;
+  if (strtab_vaddr == 0 || !vaddr_to_offset(image, phdrs, ehdr->e_phnum, strtab_vaddr, &strtab_off)) {
+    return false;
+  }
+
+  if (info->strtab_size == 0 || !elf_bounds_ok(image, strtab_off, info->strtab_size)) {
+    return false;
+  }
+
+  info->strtab = (const char *) image->data + strtab_off;
+  if (info->strtab[info->strtab_size - 1] != '\0') {
+    return false;
+  }
+
+  if (have_soname && soname_off < info->strtab_size) {
+    info->soname = info->strtab + soname_off;
+  }
+
+  return true;
+}
+
+static bool
+soname_matches(const char *path, const char *soname)
+{
+  struct elf_image image;
+  if (!load_elf_image(path, &image)) {
+    return false;
+  }
+
+  struct dynamic_info info;
+  bool match = false;
+  if (parse_file_dynamic_info(&image, &info)) {
+    if (info.soname != NULL) {
+      match = strcmp(info.soname, soname) == 0;
+    } else {
+      const char *base = strrchr(path, '/');
+      match = strcmp(base != NULL ? base + 1 : path, soname) == 0;
+    }
+    free_dynamic_info(&info);
+  }
+
+  unload_elf_image(&image);
+  return match;
+}
+
+static bool
+directory_holds_soname(const char *dir, const char *soname)
+{
+  char *candidate = NULL;
+  if (asprintf(&candidate, "%s/%s", dir, soname) < 0) {
+    return false;
+  }
+
+  struct stat st;
+  bool found = stat(candidate, &st) == 0 && S_ISREG(st.st_mode);
+  if (found) {
+    char *resolved = realpath(candidate, NULL);
+    found = resolved != NULL && path_is_safe_store_path(resolved);
+    free(resolved);
+  }
+
+  free(candidate);
+  return found;
+}
+
+static char *
+first_hit_in_search_path(const char *search_path, const char *soname)
+{
+  if (search_path == NULL) {
+    return NULL;
+  }
+
+  const char *entry = search_path;
+  while (true) {
+    const char *end = strchrnul(entry, ':');
+    size_t len = (size_t) (end - entry);
+
+    if (len > 0) {
+      char *dir = strndup(entry, len);
+      if (dir != NULL && directory_holds_soname(dir, soname)) {
+        char *hit = NULL;
+        if (asprintf(&hit, "%s/%s", dir, soname) < 0) {
+          hit = NULL;
+        }
+        free(dir);
+        return hit;
+      }
+      free(dir);
+    }
+
+    if (*end == '\0') {
+      break;
+    }
+    entry = end + 1;
+  }
+
+  return NULL;
+}
+
+static char *
+derive_resolution(uintptr_t cookie_value, const char *requester_path, const char *soname)
+{
+  if (!path_is_safe_store_path(requester_path) || !field_is_safe_soname(soname)) {
+    debugf("daemonless reject reason=invalid-fields requester=%s soname=%s",
+           requester_path, soname);
+    return NULL;
+  }
+
+  struct dynamic_info info;
+  if (!parse_mapped_dynamic_info(cookie_value, &info)) {
+    debugf("daemonless reject reason=unparsable-requester requester=%s soname=%s",
+           requester_path, soname);
+    return NULL;
+  }
+
+  char *hit = NULL;
+  const char *ld_library_path = getenv("LD_LIBRARY_PATH");
+
+  if (!dynamic_info_needs(&info, soname)) {
+    debugf("daemonless reject reason=not-needed requester=%s soname=%s", requester_path, soname);
+    goto out;
+  }
+
+  if (!info.has_runpath) {
+    debugf("daemonless reject reason=no-runpath requester=%s soname=%s", requester_path, soname);
+    goto out;
+  }
+
+  if (info.has_rpath) {
+    debugf("daemonless reject reason=rpath-present requester=%s soname=%s", requester_path, soname);
+    goto out;
+  }
+
+  if (!search_path_is_cacheable(info.runpath)) {
+    debugf("daemonless reject reason=unsafe-runpath requester=%s soname=%s", requester_path, soname);
+    goto out;
+  }
+
+  if (ld_library_path != NULL && ld_library_path[0] != '\0') {
+    if (!search_path_is_cacheable(ld_library_path)) {
+      debugf("daemonless reject reason=unsafe-ld-library-path requester=%s soname=%s",
+             requester_path, soname);
+      goto out;
+    }
+    hit = first_hit_in_search_path(ld_library_path, soname);
+  }
+
+  if (hit == NULL) {
+    hit = first_hit_in_search_path(info.runpath, soname);
+  }
+
+  if (hit == NULL) {
+    debugf("daemonless reject reason=no-hit-in-search-paths requester=%s soname=%s",
+           requester_path, soname);
+    goto out;
+  }
+
+  if (!soname_matches(hit, soname)) {
+    debugf("daemonless reject reason=soname-mismatch requester=%s soname=%s path=%s",
+           requester_path, soname, hit);
+    free(hit);
+    hit = NULL;
+  }
+
+out:
+  free_dynamic_info(&info);
+  return hit;
+}
+
+static bool
+cache_contains_line(const char *cache_path, const char *soname, const char *path)
+{
+  FILE *fp = fopen(cache_path, "r");
+  if (fp == NULL) {
+    return false;
+  }
+
+  char *line = NULL;
+  size_t cap = 0;
+  bool found = false;
+
+  while (getline(&line, &cap, fp) >= 0) {
+    char *tab = strchr(line, '\t');
+    if (tab == NULL) {
+      continue;
+    }
+    *tab = '\0';
+    char *value = tab + 1;
+    char *newline = strchr(value, '\n');
+    if (newline != NULL) {
+      *newline = '\0';
+    }
+    if (strcmp(line, soname) == 0 && strcmp(value, path) == 0) {
+      found = true;
+      break;
+    }
+  }
+
+  free(line);
+  fclose(fp);
+  return found;
+}
+
+static int
+commit_daemonless_cache_entry(const char *requester_path, const char *soname, const char *path)
+{
+  char *cache_dir = cache_dir_path();
+  if (cache_dir == NULL) {
+    return -1;
+  }
+
+  int rc = mkdir_p(cache_dir);
+  free(cache_dir);
+  if (rc != 0) {
+    return -1;
+  }
+
+  char *cache_path = cache_file_path(requester_path);
+  if (cache_path == NULL) {
+    return -1;
+  }
+
+  if (cache_contains_line(cache_path, soname, path)) {
+    free(cache_path);
+    return 0;
+  }
+
+  char *line = NULL;
+  int line_len = asprintf(&line, "%s\t%s\n", soname, path);
+  if (line_len < 0) {
+    free(cache_path);
+    return -1;
+  }
+
+  int fd = open(cache_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0664);
+  if (fd < 0) {
+    free(line);
+    free(cache_path);
+    return -1;
+  }
+
+  rc = write_full(fd, line, (size_t) line_len);
+  close(fd);
+  free(line);
+  free(cache_path);
+  return rc;
+}
+
+static void
+invalidate_scope_cache(const char *requester_path)
+{
+  pthread_mutex_lock(&state_lock);
+  if (cached_scope.requester_path != NULL
+      && strcmp(cached_scope.requester_path, requester_path) == 0) {
+    scope_cache_reset();
+  }
+  pthread_mutex_unlock(&state_lock);
+}
+
+static bool
+daemonless_enabled(void)
+{
+  const char *value = getenv("NIX_LD_AUDIT_DAEMONLESS");
+  return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int
+submit_daemonless_cache_entry(uintptr_t cookie_value, const char *requester_path, const char *soname)
+{
+  char *resolved = derive_resolution(cookie_value, requester_path, soname);
+  if (resolved == NULL) {
+    return 0;
+  }
+
+  debugf("daemonless commit requester=%s soname=%s path=%s", requester_path, soname, resolved);
+  int rc = commit_daemonless_cache_entry(requester_path, soname, resolved);
+  if (rc == 0) {
+    invalidate_scope_cache(requester_path);
+  }
+  free(resolved);
+  return rc;
+}
+
 /* MSG_NOSIGNAL keeps a daemon-side disconnect from raising SIGPIPE in the
  * audited process, which would kill an unrelated user program at startup. */
 static int
@@ -464,14 +1073,15 @@ send_full(int fd, const void *buf, size_t len)
 }
 
 /* Reports {requester, soname} and nothing else: the daemon derives the path
- * itself, so this cannot influence what gets cached.
- *
- * With no socket configured there is no privileged writer to vouch for a
- * resolution, so nothing is submitted and the loader resolves normally. Writing
- * the cache directly from here would bypass every check the daemon performs. */
+ * itself, so this cannot influence what gets cached. Daemonless mode mirrors
+ * that derivation locally and writes only to the configured per-user cache. */
 static int
-submit_cache_entry(const char *requester_path, const char *soname)
+submit_cache_entry(uintptr_t cookie_value, const char *requester_path, const char *soname)
 {
+  if (daemonless_enabled()) {
+    return submit_daemonless_cache_entry(cookie_value, requester_path, soname);
+  }
+
   const char *socket_path = getenv("NIX_LD_AUDIT_SOCKET");
   if (socket_path == NULL || socket_path[0] == '\0') {
     return 0;
@@ -584,7 +1194,7 @@ la_objsearch(const char *name, uintptr_t *cookie, unsigned int flag)
 
   /* Submitted outside state_lock: this talks to the daemon, and blocking here
    * with the lock held would serialize every other thread's resolution. */
-  submit_cache_entry(requester_path, name);
+  submit_cache_entry(*cookie, requester_path, name);
   free(requester_path);
   return (char *) name;
 }

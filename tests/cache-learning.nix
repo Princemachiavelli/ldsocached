@@ -290,10 +290,11 @@ in
 
     with subtest("no socket configured means no cache writes at all"):
         # Without a privileged writer to vouch for a resolution, the module must
-        # do nothing rather than author entries itself.
+        # do nothing unless daemonless mode is explicitly requested.
         machine.succeed("rm -f /var/cache/nix-ld-cache/*.tsv")
         out = machine.succeed(
-            "su alice -c 'NIX_LD_AUDIT_SOCKET= NIX_LD_AUDIT_DEBUG=1 "
+            "su alice -c 'NIX_LD_AUDIT_SOCKET= NIX_LD_AUDIT_DAEMONLESS= "
+            "NIX_LD_AUDIT_DEBUG=1 "
             "${demoApp}/bin/demo-app' 2>&1"
         )
         assert "demo-7" in out, f"expected the program to still work, got: {out}"
@@ -303,6 +304,28 @@ in
         machine.fail(
             "grep -R --fixed-strings '${demoLib}/lib/libdemo.so' /var/cache/nix-ld-cache"
         )
+
+    with subtest("daemonless mode writes to the configured user cache"):
+        machine.succeed("rm -rf /tmp/ldsocached-daemonless-cache")
+        out = machine.succeed(
+            "su alice -c 'mkdir -p /tmp/ldsocached-daemonless-cache && "
+            "NIX_LD_AUDIT_SOCKET= NIX_LD_AUDIT_DAEMONLESS=1 "
+            "NIX_LD_AUDIT_CACHE_DIR=/tmp/ldsocached-daemonless-cache "
+            "NIX_LD_AUDIT_DEBUG=1 ${demoApp}/bin/demo-app' 2>&1"
+        )
+        assert "demo-7" in out, f"expected the program to work, got: {out}"
+        assert "daemonless commit" in out, f"expected daemonless commit log, got: {out}"
+        machine.succeed(
+            "grep -R --fixed-strings '${demoLib}/lib/libdemo.so' "
+            "/tmp/ldsocached-daemonless-cache"
+        )
+        out = machine.succeed(
+            "su alice -c 'NIX_LD_AUDIT_SOCKET= NIX_LD_AUDIT_DAEMONLESS=1 "
+            "NIX_LD_AUDIT_CACHE_DIR=/tmp/ldsocached-daemonless-cache "
+            "NIX_LD_AUDIT_DEBUG=1 ${demoApp}/bin/demo-app' 2>&1"
+        )
+        assert "cache hit" in out, f"expected cache hit log, got: {out}"
+        assert "demo-7" in out, f"expected the program to still work, got: {out}"
 
     with subtest("the daemon survives connection exhaustion"):
         # Slots are allocated by search rather than indexed by fd, so stalled

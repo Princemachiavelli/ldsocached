@@ -38,6 +38,8 @@ Shared-cache mode:
 - the daemon service clears `LD_AUDIT` for itself to avoid self-auditing
 - set `NIX_LD_AUDIT_DAEMONLESS=1` to bypass the socket and write directly to the
   per-user cache
+- set `NIX_LD_AUDIT_DEBUG=1` to emit cache hits, misses and learn decisions to
+  stderr, matching `LD_DEBUG`'s default output stream
 
 Example build:
 

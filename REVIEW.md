@@ -252,11 +252,11 @@ checks — no `DT_NEEDED` confirmation, no RUNPATH/RPATH gating, no store-path o
 `\n`/`\t` validation, and an unchecked `dprintf()` (H5). That re-opened the
 C1/C3 threat model behind an environment variable.
 
-Fixed by deleting the local write path entirely. `NIX_LD_AUDIT_DAEMONLESS` is
-gone, and with no socket configured `submit_cache_entry()` returns without doing
-anything (`audit.c:473-477`), leaving the loader to resolve normally. There is
-now exactly one writer — the privileged daemon — so the verification in
-`derive_resolution()` cannot be bypassed by configuration.
+Fixed by making no-socket mode read-only unless `NIX_LD_AUDIT_DAEMONLESS=1` is
+explicitly set. Daemonless mode now mirrors the daemon's derivation locally:
+safe store requester, `DT_NEEDED` confirmation, RUNPATH/RPATH gating,
+store-only search paths and ELF soname validation before writing to the
+configured per-user cache.
 
 Covered by the "no socket configured means no cache writes at all" subtest: the
 program still runs and produces correct output, a miss is logged, and nothing is

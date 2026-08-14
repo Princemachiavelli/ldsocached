@@ -2,9 +2,15 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd -- "$script_dir/../.." && pwd)
 
-audit_so="${NIX_LD_AUDIT_SO:-$repo_root/result/lib/libnix-ld-cache-audit.so}"
+if [[ -f "$script_dir/../lib/libnix-ld-cache-audit.so" ]]; then
+  default_audit_so="$script_dir/../lib/libnix-ld-cache-audit.so"
+else
+  repo_root=$(cd -- "$script_dir/.." && pwd)
+  default_audit_so="$repo_root/result/lib/libnix-ld-cache-audit.so"
+fi
+
+audit_so="${NIX_LD_AUDIT_SO:-$default_audit_so}"
 if [[ $# -gt 1 && $1 == "--audit-so" ]]; then
   audit_so=$2
   shift 2
@@ -60,13 +66,13 @@ printf '\n'
 echo "audit_so: $audit_so"
 echo "cache_dir: $cache_dir"
 
-env -u LD_AUDIT -u NIX_LD_AUDIT_CACHE_DIR -u NIX_LD_AUDIT_DEBUG \
+env -u LD_AUDIT -u NIX_LD_AUDIT_CACHE_DIR -u NIX_LD_AUDIT_DAEMONLESS -u NIX_LD_AUDIT_DEBUG \
   strace -f -qq -o "$baseline_log" -e trace=%file "${cmd[@]}"
 
-env LD_AUDIT="$audit_so" NIX_LD_AUDIT_CACHE_DIR="$cache_dir" \
+env LD_AUDIT="$audit_so" NIX_LD_AUDIT_CACHE_DIR="$cache_dir" NIX_LD_AUDIT_DAEMONLESS=1 \
   strace -f -qq -o "$cold_log" -e trace=%file "${cmd[@]}"
 
-env LD_AUDIT="$audit_so" NIX_LD_AUDIT_CACHE_DIR="$cache_dir" \
+env LD_AUDIT="$audit_so" NIX_LD_AUDIT_CACHE_DIR="$cache_dir" NIX_LD_AUDIT_DAEMONLESS=1 \
   strace -f -qq -o "$warm_log" -e trace=%file "${cmd[@]}"
 
 summarize() {
