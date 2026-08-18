@@ -25,6 +25,12 @@
 #define STORE_PREFIX "/nix/store/"
 #define RUN_PREFIX "/run/"
 #define SCOPE_CACHE_CAP 16
+#ifndef NIX_LD_AUDIT_ENABLE_DEBUG
+#define NIX_LD_AUDIT_ENABLE_DEBUG 0
+#endif
+#ifndef NIX_LD_AUDIT_ENABLE_DAEMONLESS
+#define NIX_LD_AUDIT_ENABLE_DAEMONLESS 0
+#endif
 
 /* One cached file per requester scope. A small LRU keeps repeated or revisited
  * scopes from paying another open/read while the process is resolving objects. */
@@ -57,8 +63,10 @@ struct dynamic_info {
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct scope_cache scope_caches[SCOPE_CACHE_CAP];
 static uint64_t scope_cache_tick;
+#if NIX_LD_AUDIT_ENABLE_DEBUG
 static bool debug_logging;
 static bool debug_logging_resolved;
+#endif
 
 static uint64_t
 fnv1a64(const char *value)
@@ -73,6 +81,7 @@ fnv1a64(const char *value)
   return hash;
 }
 
+#if NIX_LD_AUDIT_ENABLE_DEBUG
 /* Resolved once: la_objsearch runs on the startup path this module exists to
  * speed up, so a getenv() per log call is measurable overhead. */
 static bool
@@ -86,10 +95,12 @@ debug_enabled(void)
 
   return debug_logging;
 }
+#endif
 
 static void
 debugf(const char *fmt, ...)
 {
+#if NIX_LD_AUDIT_ENABLE_DEBUG
   if (!debug_enabled()) {
     return;
   }
@@ -102,6 +113,9 @@ debugf(const char *fmt, ...)
   fputc('\n', stderr);
   funlockfile(stderr);
   va_end(ap);
+#else
+  (void) fmt;
+#endif
 }
 
 static char *
@@ -718,6 +732,7 @@ lookup_cache_entry(const char *requester_path, const char *soname)
   return scan_scope_cache(cache, soname);
 }
 
+#if NIX_LD_AUDIT_ENABLE_DAEMONLESS
 static int
 mkdir_p(const char *path)
 {
@@ -1186,7 +1201,9 @@ invalidate_scope_cache(const char *requester_path)
   }
   pthread_mutex_unlock(&state_lock);
 }
+#endif
 
+#if NIX_LD_AUDIT_ENABLE_DAEMONLESS
 static bool
 daemonless_enabled(void)
 {
@@ -1210,6 +1227,7 @@ submit_daemonless_cache_entry(uintptr_t cookie_value, const char *requester_path
   free(resolved);
   return rc;
 }
+#endif
 
 /* MSG_NOSIGNAL keeps a daemon-side disconnect from raising SIGPIPE in the
  * audited process, which would kill an unrelated user program at startup. */
@@ -1239,9 +1257,13 @@ send_full(int fd, const void *buf, size_t len)
 static int
 submit_cache_entry(uintptr_t cookie_value, const char *requester_path, const char *soname)
 {
+#if NIX_LD_AUDIT_ENABLE_DAEMONLESS
   if (daemonless_enabled()) {
     return submit_daemonless_cache_entry(cookie_value, requester_path, soname);
   }
+#else
+  (void) cookie_value;
+#endif
 
   const char *socket_path = getenv("NIX_LD_AUDIT_SOCKET");
   if (socket_path == NULL || socket_path[0] == '\0') {

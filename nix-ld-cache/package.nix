@@ -4,6 +4,8 @@
   makeWrapper,
   strace,
   ripgrep,
+  enableAuditDebug ? false,
+  enableAuditDaemonless ? false,
 }:
 
 stdenv.mkDerivation {
@@ -20,9 +22,12 @@ stdenv.mkDerivation {
     runHook preBuild
     # No -fvisibility=hidden: it hides the la_* hooks and glibc then refuses to
     # load the module as an audit interface.
+    audit_feature_flags="${lib.optionalString enableAuditDebug "-DNIX_LD_AUDIT_ENABLE_DEBUG=1"} ${
+      lib.optionalString enableAuditDaemonless "-DNIX_LD_AUDIT_ENABLE_DAEMONLESS=1"
+    }"
     audit_size_flags="-fno-plt -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables"
     audit_ld_size_flags="-Wl,--as-needed -Wl,--gc-sections -Wl,--hash-style=gnu"
-    $CC -fPIC -shared -O2 $audit_size_flags -Wall -Wextra -Wformat -Wformat-security \
+    $CC -fPIC -shared -Os -nostartfiles $audit_feature_flags $audit_size_flags -Wall -Wextra -Wformat -Wformat-security \
       -D_FORTIFY_SOURCE=3 -fstack-protector-strong -Wl,-z,relro,-z,now $audit_ld_size_flags \
       -o libnix-ld-cache-audit.so nix-ld-cache-audit.c -pthread
     $CC -O2 -Wall -Wextra -Wformat -Wformat-security \

@@ -60,7 +60,10 @@
       checks = forEachLinuxSystem (
         { pkgs, system }:
         let
-          package = self.packages.${system}.default;
+          package = self.packages.${system}.default.override {
+            enableAuditDebug = true;
+            enableAuditDaemonless = true;
+          };
         in
         {
           module-environment = pkgs.testers.runNixOSTest (
