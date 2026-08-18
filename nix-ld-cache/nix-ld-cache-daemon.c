@@ -25,6 +25,7 @@
 #define MAX_CONNECTIONS 256
 #define CONNECTION_TIMEOUT_MS 5000
 #define STORE_PREFIX "/nix/store/"
+#define WRITE_SCOPE_CACHE_CAP 64
 
 /* Sentinel in epoll_event.data.u32, which otherwise carries a slot index. */
 #define LISTEN_SLOT UINT32_MAX
@@ -65,6 +66,16 @@ struct dynamic_info {
   const char **needed;
   size_t needed_count;
 };
+
+struct write_scope_cache {
+  char *cache_path;
+  char *file_contents;
+  size_t file_len;
+  uint64_t last_used;
+};
+
+static struct write_scope_cache write_scope_caches[WRITE_SCOPE_CACHE_CAP];
+static uint64_t write_scope_cache_tick;
 
 static void
 handle_signal(int signo)
@@ -613,38 +624,173 @@ cache_file_path(const char *cache_dir, const char *requester_path, const char *l
   return path;
 }
 
-static bool
-cache_contains_line(const char *cache_path, const char *soname, const char *path)
+static char *
+read_scope_file(const char *cache_path, size_t *len_out)
 {
-  FILE *fp = fopen(cache_path, "r");
-  if (fp == NULL) {
-    return false;
+  int fd = open(cache_path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno != ENOENT) {
+      return NULL;
+    }
+    char *empty = malloc(1);
+    if (empty != NULL) {
+      *len_out = 0;
+    }
+    return empty;
   }
 
-  char *line = NULL;
-  size_t cap = 0;
-  bool found = false;
+  size_t cap = 8192;
+  size_t len = 0;
+  char *buf = malloc(cap);
+  if (buf == NULL) {
+    close(fd);
+    return NULL;
+  }
 
-  while (getline(&line, &cap, fp) >= 0) {
-    char *tab = strchr(line, '\t');
-    if (tab == NULL) {
-      continue;
+  while (true) {
+    if (len == cap) {
+      size_t next_cap = cap * 2;
+      char *next = realloc(buf, next_cap);
+      if (next == NULL) {
+        free(buf);
+        close(fd);
+        return NULL;
+      }
+      buf = next;
+      cap = next_cap;
     }
-    *tab = '\0';
-    char *value = tab + 1;
-    char *newline = strchr(value, '\n');
-    if (newline != NULL) {
-      *newline = '\0';
+
+    ssize_t rc = read(fd, buf + len, cap - len);
+    if (rc < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      free(buf);
+      close(fd);
+      return NULL;
     }
-    if (strcmp(line, soname) == 0 && strcmp(value, path) == 0) {
-      found = true;
+    if (rc == 0) {
       break;
     }
+    len += (size_t) rc;
   }
 
-  free(line);
-  fclose(fp);
-  return found;
+  close(fd);
+  *len_out = len;
+  return buf;
+}
+
+static void
+write_scope_cache_reset(struct write_scope_cache *cache)
+{
+  free(cache->cache_path);
+  free(cache->file_contents);
+  memset(cache, 0, sizeof(*cache));
+}
+
+static struct write_scope_cache *
+write_scope_cache_find(const char *cache_path)
+{
+  for (size_t i = 0; i < WRITE_SCOPE_CACHE_CAP; ++i) {
+    struct write_scope_cache *cache = &write_scope_caches[i];
+    if (cache->cache_path != NULL && strcmp(cache->cache_path, cache_path) == 0) {
+      cache->last_used = ++write_scope_cache_tick;
+      return cache;
+    }
+  }
+
+  return NULL;
+}
+
+static struct write_scope_cache *
+write_scope_cache_victim(void)
+{
+  struct write_scope_cache *victim = &write_scope_caches[0];
+
+  for (size_t i = 0; i < WRITE_SCOPE_CACHE_CAP; ++i) {
+    struct write_scope_cache *cache = &write_scope_caches[i];
+    if (cache->cache_path == NULL) {
+      return cache;
+    }
+    if (cache->last_used < victim->last_used) {
+      victim = cache;
+    }
+  }
+
+  return victim;
+}
+
+static struct write_scope_cache *
+write_scope_cache_load(const char *cache_path)
+{
+  struct write_scope_cache *cache = write_scope_cache_find(cache_path);
+  if (cache != NULL) {
+    return cache;
+  }
+
+  size_t len = 0;
+  char *contents = read_scope_file(cache_path, &len);
+  if (contents == NULL) {
+    return NULL;
+  }
+
+  cache = write_scope_cache_victim();
+  write_scope_cache_reset(cache);
+  cache->cache_path = xstrdup(cache_path);
+  if (cache->cache_path == NULL) {
+    free(contents);
+    return NULL;
+  }
+  cache->file_contents = contents;
+  cache->file_len = len;
+  cache->last_used = ++write_scope_cache_tick;
+  return cache;
+}
+
+static bool
+write_scope_cache_contains_line(const struct write_scope_cache *cache,
+                                const char *soname, const char *path)
+{
+  const char *p = cache->file_contents;
+  const char *end = p + cache->file_len;
+  size_t soname_len = strlen(soname);
+  size_t path_len = strlen(path);
+
+  while (p < end) {
+    const char *newline = memchr(p, '\n', (size_t) (end - p));
+    const char *line_end = newline != NULL ? newline : end;
+    const char *tab = memchr(p, '\t', (size_t) (line_end - p));
+
+    if (tab != NULL
+        && (size_t) (tab - p) == soname_len
+        && (size_t) (line_end - tab - 1) == path_len
+        && memcmp(p, soname, soname_len) == 0
+        && memcmp(tab + 1, path, path_len) == 0) {
+      return true;
+    }
+
+    if (newline == NULL) {
+      break;
+    }
+    p = newline + 1;
+  }
+
+  return false;
+}
+
+static int
+write_scope_cache_append_line(struct write_scope_cache *cache, const char *line, size_t line_len)
+{
+  char *contents = realloc(cache->file_contents, cache->file_len + line_len);
+  if (contents == NULL) {
+    return -1;
+  }
+
+  memcpy(contents + cache->file_len, line, line_len);
+  cache->file_contents = contents;
+  cache->file_len += line_len;
+  cache->last_used = ++write_scope_cache_tick;
+  return 0;
 }
 
 static void
@@ -660,7 +806,8 @@ commit_cache_entry(const char *cache_dir, const char *requester_path,
     return;
   }
 
-  if (cache_contains_line(cache_path, soname, path)) {
+  struct write_scope_cache *cache = write_scope_cache_load(cache_path);
+  if (cache != NULL && write_scope_cache_contains_line(cache, soname, path)) {
     free(cache_path);
     return;
   }
@@ -675,6 +822,9 @@ commit_cache_entry(const char *cache_dir, const char *requester_path,
       /* One write so concurrent readers never observe a torn line. */
       if (write_full(fd, line, (size_t) line_len) != 0) {
         debugf("write failed requester=%s soname=%s", requester_path, soname);
+      } else if (cache != NULL
+                 && write_scope_cache_append_line(cache, line, (size_t) line_len) != 0) {
+        write_scope_cache_reset(cache);
       }
       close(fd);
     }

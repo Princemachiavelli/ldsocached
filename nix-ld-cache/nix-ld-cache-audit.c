@@ -24,15 +24,18 @@
 
 #define STORE_PREFIX "/nix/store/"
 #define RUN_PREFIX "/run/"
+#define SCOPE_CACHE_CAP 16
 
-/* One cached file per requester scope. glibc holds dl_load_lock across an entire
- * DT_NEEDED search, so a process resolves one requester at a time and a single
- * memoized scope covers every soname in that batch. */
+/* One cached file per requester scope. A small LRU keeps repeated or revisited
+ * scopes from paying another open/read while the process is resolving objects. */
 struct scope_cache {
+  char *cache_path;
   char *requester_path;
   char *ld_library_path;
   char *file_contents;
   size_t file_len;
+  struct stat file_stat;
+  uint64_t last_used;
 };
 
 struct elf_image {
@@ -52,7 +55,8 @@ struct dynamic_info {
 };
 
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct scope_cache cached_scope;
+static struct scope_cache scope_caches[SCOPE_CACHE_CAP];
+static uint64_t scope_cache_tick;
 static bool debug_logging;
 static bool debug_logging_resolved;
 
@@ -454,10 +458,16 @@ file_exists_readable(const char *path)
 }
 
 static char *
-read_whole_file(const char *path, size_t *len_out)
+read_whole_file(const char *path, size_t *len_out, struct stat *stat_out)
 {
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
+    return NULL;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    close(fd);
     return NULL;
   }
 
@@ -499,21 +509,80 @@ read_whole_file(const char *path, size_t *len_out)
 
   close(fd);
   *len_out = len;
+  *stat_out = st;
   return buf;
 }
 
 static void
-scope_cache_reset(void)
+scope_cache_reset(struct scope_cache *cache)
 {
-  free(cached_scope.requester_path);
-  free(cached_scope.ld_library_path);
-  free(cached_scope.file_contents);
-  memset(&cached_scope, 0, sizeof(cached_scope));
+  free(cache->cache_path);
+  free(cache->requester_path);
+  free(cache->ld_library_path);
+  free(cache->file_contents);
+  memset(cache, 0, sizeof(*cache));
+}
+
+static bool
+stat_matches(const struct stat *left, const struct stat *right)
+{
+  return left->st_dev == right->st_dev
+    && left->st_ino == right->st_ino
+    && left->st_size == right->st_size
+    && left->st_mtim.tv_sec == right->st_mtim.tv_sec
+    && left->st_mtim.tv_nsec == right->st_mtim.tv_nsec
+    && left->st_ctim.tv_sec == right->st_ctim.tv_sec
+    && left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+}
+
+static bool
+scope_cache_current(const struct scope_cache *cache)
+{
+  struct stat st;
+  return cache->cache_path != NULL
+    && stat(cache->cache_path, &st) == 0
+    && S_ISREG(st.st_mode)
+    && stat_matches(&cache->file_stat, &st);
+}
+
+static struct scope_cache *
+scope_cache_find(const char *requester_path, const char *ld_library_path)
+{
+  for (size_t i = 0; i < SCOPE_CACHE_CAP; ++i) {
+    struct scope_cache *cache = &scope_caches[i];
+    if (cache->requester_path != NULL
+        && cache->ld_library_path != NULL
+        && strcmp(cache->requester_path, requester_path) == 0
+        && strcmp(cache->ld_library_path, ld_library_path) == 0) {
+      cache->last_used = ++scope_cache_tick;
+      return cache;
+    }
+  }
+
+  return NULL;
+}
+
+static struct scope_cache *
+scope_cache_victim(void)
+{
+  struct scope_cache *victim = &scope_caches[0];
+
+  for (size_t i = 0; i < SCOPE_CACHE_CAP; ++i) {
+    struct scope_cache *cache = &scope_caches[i];
+    if (cache->requester_path == NULL) {
+      return cache;
+    }
+    if (cache->last_used < victim->last_used) {
+      victim = cache;
+    }
+  }
+
+  return victim;
 }
 
 /* Loads and memoizes the scope's cache file. Missing files are not memoized:
  * the daemon may create them after an earlier miss in the same process. */
-static bool
+static struct scope_cache *
 scope_cache_load(const char *requester_path)
 {
   const char *ld_library_path = getenv("LD_LIBRARY_PATH");
@@ -521,46 +590,49 @@ scope_cache_load(const char *requester_path)
     ld_library_path = "";
   }
 
-  if (cached_scope.requester_path != NULL
-      && cached_scope.ld_library_path != NULL
-      && strcmp(cached_scope.requester_path, requester_path) == 0
-      && strcmp(cached_scope.ld_library_path, ld_library_path) == 0) {
-    return cached_scope.file_contents != NULL;
+  struct scope_cache *cache = scope_cache_find(requester_path, ld_library_path);
+  if (cache != NULL) {
+    return cache;
   }
-
-  scope_cache_reset();
 
   char *cache_path = cache_file_path(requester_path, ld_library_path);
   if (cache_path == NULL) {
-    return false;
+    return NULL;
   }
 
   size_t len = 0;
-  char *contents = read_whole_file(cache_path, &len);
-  free(cache_path);
+  struct stat st;
+  char *contents = read_whole_file(cache_path, &len, &st);
   if (contents == NULL) {
-    return false;
+    free(cache_path);
+    return NULL;
   }
 
-  cached_scope.requester_path = xstrdup(requester_path);
-  cached_scope.ld_library_path = xstrdup(ld_library_path);
-  if (cached_scope.requester_path == NULL || cached_scope.ld_library_path == NULL) {
+  cache = scope_cache_victim();
+  scope_cache_reset(cache);
+
+  cache->cache_path = cache_path;
+  cache->requester_path = xstrdup(requester_path);
+  cache->ld_library_path = xstrdup(ld_library_path);
+  if (cache->requester_path == NULL || cache->ld_library_path == NULL) {
     free(contents);
-    scope_cache_reset();
-    return false;
+    scope_cache_reset(cache);
+    return NULL;
   }
 
-  cached_scope.file_contents = contents;
-  cached_scope.file_len = len;
-  return true;
+  cache->file_contents = contents;
+  cache->file_len = len;
+  cache->file_stat = st;
+  cache->last_used = ++scope_cache_tick;
+  return cache;
 }
 
 /* Scans the memoized scope for soname. Caller holds state_lock. */
 static char *
-scan_scope_cache(const char *soname)
+scan_scope_cache(const struct scope_cache *cache, const char *soname)
 {
-  const char *p = cached_scope.file_contents;
-  const char *end = p + cached_scope.file_len;
+  const char *p = cache->file_contents;
+  const char *end = p + cache->file_len;
   size_t soname_len = strlen(soname);
 
   while (p < end) {
@@ -588,26 +660,62 @@ scan_scope_cache(const char *soname)
   return NULL;
 }
 
+static bool
+scope_cache_contains_line(const struct scope_cache *cache, const char *soname, const char *path)
+{
+  const char *p = cache->file_contents;
+  const char *end = p + cache->file_len;
+  size_t soname_len = strlen(soname);
+  size_t path_len = strlen(path);
+
+  while (p < end) {
+    const char *newline = memchr(p, '\n', (size_t) (end - p));
+    const char *line_end = newline != NULL ? newline : end;
+    const char *tab = memchr(p, '\t', (size_t) (line_end - p));
+
+    if (tab != NULL
+        && (size_t) (tab - p) == soname_len
+        && (size_t) (line_end - tab - 1) == path_len
+        && memcmp(p, soname, soname_len) == 0
+        && memcmp(tab + 1, path, path_len) == 0) {
+      return true;
+    }
+
+    if (newline == NULL) {
+      break;
+    }
+    p = newline + 1;
+  }
+
+  return false;
+}
+
 /* The daemon appends to scope files asynchronously, so a loaded scope can become
  * stale after a miss. Retry once with a fresh read before falling back to glibc. */
 static char *
 lookup_cache_entry(const char *requester_path, const char *soname)
 {
-  if (!scope_cache_load(requester_path)) {
+  struct scope_cache *cache = scope_cache_load(requester_path);
+  if (cache == NULL) {
     return NULL;
   }
 
-  char *path = scan_scope_cache(soname);
+  char *path = scan_scope_cache(cache, soname);
   if (path != NULL) {
     return path;
   }
 
-  scope_cache_reset();
-  if (!scope_cache_load(requester_path)) {
+  if (scope_cache_current(cache)) {
     return NULL;
   }
 
-  return scan_scope_cache(soname);
+  scope_cache_reset(cache);
+  cache = scope_cache_load(requester_path);
+  if (cache == NULL) {
+    return NULL;
+  }
+
+  return scan_scope_cache(cache, soname);
 }
 
 static int
@@ -970,7 +1078,7 @@ out:
 }
 
 static bool
-cache_contains_line(const char *cache_path, const char *soname, const char *path)
+disk_cache_contains_line(const char *cache_path, const char *soname, const char *path)
 {
   FILE *fp = fopen(cache_path, "r");
   if (fp == NULL) {
@@ -1027,7 +1135,20 @@ commit_daemonless_cache_entry(const char *requester_path, const char *soname, co
     return -1;
   }
 
-  if (cache_contains_line(cache_path, soname, path)) {
+  bool cache_proves_absent = false;
+  pthread_mutex_lock(&state_lock);
+  struct scope_cache *cache = scope_cache_find(requester_path, ld_library_path);
+  if (cache != NULL && scope_cache_current(cache)) {
+    if (scope_cache_contains_line(cache, soname, path)) {
+      pthread_mutex_unlock(&state_lock);
+      free(cache_path);
+      return 0;
+    }
+    cache_proves_absent = true;
+  }
+  pthread_mutex_unlock(&state_lock);
+
+  if (!cache_proves_absent && disk_cache_contains_line(cache_path, soname, path)) {
     free(cache_path);
     return 0;
   }
@@ -1057,9 +1178,11 @@ static void
 invalidate_scope_cache(const char *requester_path)
 {
   pthread_mutex_lock(&state_lock);
-  if (cached_scope.requester_path != NULL
-      && strcmp(cached_scope.requester_path, requester_path) == 0) {
-    scope_cache_reset();
+  for (size_t i = 0; i < SCOPE_CACHE_CAP; ++i) {
+    if (scope_caches[i].requester_path != NULL
+        && strcmp(scope_caches[i].requester_path, requester_path) == 0) {
+      scope_cache_reset(&scope_caches[i]);
+    }
   }
   pthread_mutex_unlock(&state_lock);
 }
