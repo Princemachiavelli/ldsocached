@@ -61,28 +61,76 @@
         nix-ld-cache = ./default.nix;
       };
 
-      checks = forEachLinuxSystem (
-        { pkgs, system }:
-        let
-          package = self.packages.${system}.default.override {
-            enableAuditDebug = true;
-            enableAuditDaemonless = true;
-          };
-        in
-        {
-          module-environment = pkgs.testers.runNixOSTest (
-            import ./tests/module-environment.nix {
-              inherit self pkgs package;
-            }
-          );
-          cache-learning = pkgs.testers.runNixOSTest (
-            import ./tests/cache-learning.nix {
-              inherit self pkgs package;
-              oldGlibcApp = inputs.nixpkgs-oldglibc.legacyPackages.${system}.hello;
-            }
-          );
-        }
-      );
+      checks =
+        forEachLinuxSystem (
+          { pkgs, system }:
+          let
+            package = self.packages.${system}.default.override {
+              enableAuditDebug = true;
+              enableAuditDaemonless = true;
+            };
+          in
+          {
+            module-environment = pkgs.testers.runNixOSTest (
+              import ./tests/module-environment.nix {
+                inherit self pkgs package;
+              }
+            );
+            cache-learning = pkgs.testers.runNixOSTest (
+              import ./tests/cache-learning.nix {
+                inherit self pkgs package;
+                oldGlibcApp = inputs.nixpkgs-oldglibc.legacyPackages.${system}.hello;
+              }
+            );
+          }
+        )
+        // {
+          # aarch64-linux guest on an aarch64-darwin host: qemu-common.nix's
+          # host/guest matrix picks -accel hvf here, so the VM test runs
+          # accelerated on Apple Silicon directly instead of nested inside
+          # the (unaccelerated, TCG-only) apple-virt Linux builder.
+          aarch64-darwin =
+            let
+              hostPkgs = import inputs.nixpkgs {
+                system = "aarch64-darwin";
+                config.allowUnfree = true;
+              };
+              linuxPkgs = import inputs.nixpkgs {
+                system = "aarch64-linux";
+                config.allowUnfree = true;
+              };
+              package = self.packages.aarch64-linux.default.override {
+                enableAuditDebug = true;
+                enableAuditDaemonless = true;
+              };
+              # Fail loudly if HVF is ever unavailable instead of silently
+              # falling back to TCG and reproducing the nested-virt timeout.
+              forceHvf = {
+                defaults.virtualisation.qemu.forceAccel = lib.mkForce true;
+              };
+            in
+            {
+              module-environment = hostPkgs.testers.runNixOSTest {
+                imports = [
+                  (import ./tests/module-environment.nix {
+                    inherit self package;
+                    pkgs = linuxPkgs;
+                  })
+                  forceHvf
+                ];
+              };
+              cache-learning = hostPkgs.testers.runNixOSTest {
+                imports = [
+                  (import ./tests/cache-learning.nix {
+                    inherit self package;
+                    pkgs = linuxPkgs;
+                    oldGlibcApp = inputs.nixpkgs-oldglibc.legacyPackages.aarch64-linux.hello;
+                  })
+                  forceHvf
+                ];
+              };
+            };
+        };
 
       overlays.default = prev: final: {
         nix-ld-cache = prev.callPackage ./nix-ld-cache/package.nix { };

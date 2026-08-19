@@ -72,6 +72,14 @@ struct write_scope_cache {
   char *file_contents;
   size_t file_len;
   uint64_t last_used;
+  /* Identity of the file this snapshot was read from, so a change made by
+   * anything other than this cache (an external `rm`, truncate, etc.) is
+   * detected with a cheap stat() instead of trusted forever. */
+  bool exists;
+  dev_t dev;
+  ino_t ino;
+  off_t size;
+  struct timespec mtim;
 };
 
 static struct write_scope_cache write_scope_caches[WRITE_SCOPE_CACHE_CAP];
@@ -720,12 +728,49 @@ write_scope_cache_victim(void)
   return victim;
 }
 
+/* NULL `st` means the file does not currently exist. */
+static bool
+write_scope_cache_matches(const struct write_scope_cache *cache, const struct stat *st)
+{
+  if (st == NULL) {
+    return !cache->exists;
+  }
+
+  return cache->exists && cache->dev == st->st_dev && cache->ino == st->st_ino
+    && cache->size == st->st_size && cache->mtim.tv_sec == st->st_mtim.tv_sec
+    && cache->mtim.tv_nsec == st->st_mtim.tv_nsec;
+}
+
+static void
+write_scope_cache_set_stat(struct write_scope_cache *cache, const struct stat *st)
+{
+  cache->exists = st != NULL;
+  if (st != NULL) {
+    cache->dev = st->st_dev;
+    cache->ino = st->st_ino;
+    cache->size = st->st_size;
+    cache->mtim = st->st_mtim;
+  }
+}
+
 static struct write_scope_cache *
 write_scope_cache_load(const char *cache_path)
 {
+  struct stat st;
+  bool file_exists = stat(cache_path, &st) == 0;
+  if (!file_exists && errno != ENOENT) {
+    return NULL;
+  }
+
   struct write_scope_cache *cache = write_scope_cache_find(cache_path);
   if (cache != NULL) {
-    return cache;
+    if (write_scope_cache_matches(cache, file_exists ? &st : NULL)) {
+      return cache;
+    }
+    /* The file changed or vanished underneath us (an external rm, a
+     * truncate, ...): a stale in-memory snapshot must not keep pretending
+     * it reflects what is on disk. Fall through and reload it. */
+    write_scope_cache_reset(cache);
   }
 
   size_t len = 0;
@@ -734,8 +779,10 @@ write_scope_cache_load(const char *cache_path)
     return NULL;
   }
 
-  cache = write_scope_cache_victim();
-  write_scope_cache_reset(cache);
+  if (cache == NULL) {
+    cache = write_scope_cache_victim();
+    write_scope_cache_reset(cache);
+  }
   cache->cache_path = xstrdup(cache_path);
   if (cache->cache_path == NULL) {
     free(contents);
@@ -744,6 +791,7 @@ write_scope_cache_load(const char *cache_path)
   cache->file_contents = contents;
   cache->file_len = len;
   cache->last_used = ++write_scope_cache_tick;
+  write_scope_cache_set_stat(cache, file_exists ? &st : NULL);
   return cache;
 }
 
@@ -822,9 +870,17 @@ commit_cache_entry(const char *cache_dir, const char *requester_path,
       /* One write so concurrent readers never observe a torn line. */
       if (write_full(fd, line, (size_t) line_len) != 0) {
         debugf("write failed requester=%s soname=%s", requester_path, soname);
-      } else if (cache != NULL
-                 && write_scope_cache_append_line(cache, line, (size_t) line_len) != 0) {
-        write_scope_cache_reset(cache);
+      } else if (cache != NULL) {
+        struct stat st;
+        /* Re-stat the fd we just wrote through so the cache's own identity
+         * tracks its own write, instead of appearing stale (and forcing a
+         * pointless re-read) on the very next lookup in this scope. */
+        if (write_scope_cache_append_line(cache, line, (size_t) line_len) != 0
+            || fstat(fd, &st) != 0) {
+          write_scope_cache_reset(cache);
+        } else {
+          write_scope_cache_set_stat(cache, &st);
+        }
       }
       close(fd);
     }
