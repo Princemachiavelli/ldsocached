@@ -2,6 +2,10 @@
   description = "LD_AUDIT-based resolver cache for Nix store binaries";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # Pinned only to build a binary against an older glibc family for the
+  # regression test in tests/cache-learning.nix: the audit module must load
+  # into such processes without dragging in a second glibc (SYSCALL_ONLY.md).
+  inputs.nixpkgs-oldglibc.url = "github:NixOS/nixpkgs/nixos-23.05";
 
   outputs =
     { self, ... }@inputs:
@@ -74,6 +78,7 @@
           cache-learning = pkgs.testers.runNixOSTest (
             import ./tests/cache-learning.nix {
               inherit self pkgs package;
+              oldGlibcApp = inputs.nixpkgs-oldglibc.legacyPackages.${system}.hello;
             }
           );
         }

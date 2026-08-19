@@ -2,6 +2,9 @@
   self,
   pkgs,
   package,
+  # A binary linked against an older glibc family than the one the audit
+  # module was built with.
+  oldGlibcApp,
 }:
 let
   demoLib = pkgs.stdenv.mkDerivation {
@@ -533,6 +536,18 @@ in
         )
         assert "cache hit" in out, f"expected cache hit log, got: {out}"
         assert "demo-7" in out, f"expected the program to still work, got: {out}"
+
+    with subtest("an older-glibc binary starts under the audit module"):
+        # Regression for the pre-freestanding failure mode: an audit module
+        # with DT_NEEDED on glibc made the loader map the module's glibc next
+        # to the process's older one, which crashed before any hook ran. The
+        # second assert proves the module actually engaged rather than being
+        # silently skipped.
+        out = machine.succeed(
+            "su alice -c 'NIX_LD_AUDIT_DEBUG=1 ${oldGlibcApp}/bin/hello' 2>&1"
+        )
+        assert "Hello, world!" in out, f"expected older-glibc binary to run, got: {out}"
+        assert "nix-ld-cache-audit:" in out, f"expected audit module activity, got: {out}"
 
     with subtest("the daemon survives connection exhaustion"):
         # Slots are allocated by search rather than indexed by fd, so stalled

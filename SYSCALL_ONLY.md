@@ -1,5 +1,32 @@
 # Syscall-only audit module plan
 
+## Status: implemented
+
+The audit module is built freestanding (`-nostdlib -ffreestanding
+-fno-builtin`) for x86_64-linux and aarch64-linux from day one, since both are
+flake check targets. Raw syscall wrappers and the kernel ABI structs live in
+`linux-syscall.h`; the build asserts the resulting object has no `DT_NEEDED`
+entries and links with `-Wl,--no-undefined -Wl,-Bsymbolic`.
+
+Deviations from the plan below, with reasons:
+
+- Daemonless mode was ported in the same pass instead of staying behind a
+  flag: the flake checks build with `enableAuditDaemonless = true` and
+  exercise it, and it reuses every helper the daemon path needed anyway.
+- Environment access reads `/proc/self/environ` once into a private mapping
+  rather than chasing the initial stack; the module already depends on /proc
+  for `/proc/self/exe`. glibc snapshots `LD_LIBRARY_PATH` at startup, so a
+  one-shot snapshot matches loader semantics.
+- `realpath` is implemented as `open(O_PATH)` + `readlink /proc/self/fd/N`
+  instead of a userspace path walker.
+- Heap allocation is gone: scope caches use fixed buffers, cache files are
+  `mmap`ed instead of read into `malloc`ed buffers, and the strings returned
+  to glibc (which it never frees) come from a never-freed mmap bump arena.
+- Scope keys are streamed through FNV-1a instead of materialized; the hashed
+  bytes stay identical to the daemon's `cache_scope_key()`.
+- The regression test runs a `nixos-23.05` (older glibc) binary under the
+  audit module inside the cache-learning VM test.
+
 ## Problem
 
 The audit shared object currently depends on glibc. When `LD_AUDIT` points to

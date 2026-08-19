@@ -25,11 +25,30 @@ stdenv.mkDerivation {
     audit_feature_flags="${lib.optionalString enableAuditDebug "-DNIX_LD_AUDIT_ENABLE_DEBUG=1"} ${
       lib.optionalString enableAuditDaemonless "-DNIX_LD_AUDIT_ENABLE_DAEMONLESS=1"
     }"
+    # Freestanding: the audit module must not link or call libc, or it drags a
+    # second glibc family into processes built against another one
+    # (SYSCALL_ONLY.md). -fno-tree-loop-distribute-patterns keeps GCC from
+    # rewriting the module's own memcpy/memset loops into recursive calls to
+    # themselves. No fortify or stack-protector here: both emit references to
+    # libc symbols that no longer exist at link time.
+    audit_freestanding_flags="-nostdlib -nostartfiles -ffreestanding -fno-builtin -fno-stack-protector -fno-tree-loop-distribute-patterns${lib.optionalString stdenv.hostPlatform.isAarch64 " -mno-outline-atomics"}"
     audit_size_flags="-fno-plt -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables"
-    audit_ld_size_flags="-Wl,--as-needed -Wl,--gc-sections -Wl,--hash-style=gnu"
-    $CC -fPIC -shared -Os -nostartfiles $audit_feature_flags $audit_size_flags -Wall -Wextra -Wformat -Wformat-security \
-      -D_FORTIFY_SOURCE=3 -fstack-protector-strong -Wl,-z,relro,-z,now $audit_ld_size_flags \
-      -o libnix-ld-cache-audit.so nix-ld-cache-audit.c -pthread
+    audit_ld_flags="-Wl,--as-needed -Wl,--gc-sections -Wl,--hash-style=gnu -Wl,-z,relro,-z,now -Wl,-Bsymbolic -Wl,--no-undefined"
+    # NIX_HARDENING_ENABLE is cleared for this one compile so the cc wrapper
+    # does not re-inject fortify/stack-protector flags behind our back; the
+    # daemon build below keeps the default hardening.
+    NIX_HARDENING_ENABLE= $CC -fPIC -shared -Os $audit_feature_flags $audit_freestanding_flags \
+      $audit_size_flags -Wall -Wextra $audit_ld_flags \
+      -o libnix-ld-cache-audit.so nix-ld-cache-audit.c
+
+    # The target property of the freestanding build: zero dynamic dependencies,
+    # so the loader can map the module without loading any libc.
+    if $READELF -d libnix-ld-cache-audit.so | grep -q 'NEEDED'; then
+      echo "error: libnix-ld-cache-audit.so has DT_NEEDED entries:" >&2
+      $READELF -d libnix-ld-cache-audit.so >&2
+      exit 1
+    fi
+
     $CC -O2 -Wall -Wextra -Wformat -Wformat-security \
       -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now \
       -o nix-ld-cache-daemon nix-ld-cache-daemon.c

@@ -1,7 +1,7 @@
 #ifndef NIX_LD_CACHE_PROTOCOL_H
 #define NIX_LD_CACHE_PROTOCOL_H
 
-#include <assert.h>
+/* Only freestanding headers: the audit module includes this without libc. */
 #include <stdint.h>
 
 #define NIX_LD_CACHE_PROTOCOL_MAGIC 0x4e4c4348u
@@ -20,7 +20,7 @@ struct nix_ld_cache_msg {
 
 /* Read raw off the wire, so a padding-free layout must be guaranteed rather
  * than incidental. */
-static_assert(sizeof(struct nix_ld_cache_msg) == 5 * sizeof(uint32_t),
-              "nix_ld_cache_msg must be padding-free");
+_Static_assert(sizeof(struct nix_ld_cache_msg) == 5 * sizeof(uint32_t),
+               "nix_ld_cache_msg must be padding-free");
 
 #endif
