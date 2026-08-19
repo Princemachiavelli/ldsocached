@@ -518,7 +518,10 @@ write_full(long fd, const void *buf, size_t len)
 static int debug_lock;
 static bool debug_logging;
 static bool debug_logging_resolved;
-static char debug_buf[16384];
+/* 4x NIX_LD_CACHE_PROTOCOL_MAX_FIELD: the widest line is three %s fields
+ * (requester, soname, resolved path), each bounded by that constant, plus a
+ * short literal prefix. sbuf_putn truncates safely if that is ever wrong. */
+static char debug_buf[4 * NIX_LD_CACHE_PROTOCOL_MAX_FIELD];
 
 /* Resolved once: la_objsearch runs on the startup path this module exists to
  * speed up, so an env scan per log call is measurable overhead. */
@@ -771,7 +774,16 @@ parse_mapped_dynamic_info(uintptr_t cookie_value, struct dynamic_info *info)
     }
   }
 
-  if (info->strtab == NULL || info->strtab_size == 0 || (uintptr_t) info->strtab < 0x1000) {
+  /* DT_STRTAB/DT_STRSZ come from this object's own .dynamic section, which a
+   * hostile object (e.g. something dlopen()ed from a less-trusted path) can
+   * set to whatever it likes. Unlike parse_file_dynamic_info, there is no
+   * independent "real size of this mapping" to check against here, so an
+   * unbounded strtab_size turns the very next line into a read at an
+   * attacker-chosen offset. Cap it at a generous sanity ceiling instead --
+   * real .dynstr tables, even a heavily-exported library's, are a few tens
+   * of KB -- so this only ever rejects something already implausible. */
+  if (info->strtab == NULL || info->strtab_size == 0
+      || info->strtab_size > (1024u * 1024u) || (uintptr_t) info->strtab < 0x1000) {
     return false;
   }
 
@@ -781,6 +793,16 @@ parse_mapped_dynamic_info(uintptr_t cookie_value, struct dynamic_info *info)
 
   if (info->has_runpath) {
     if (runpath_off >= info->strtab_size) {
+      return false;
+    }
+    /* Bounded independently of the whole-table check above: a NUL that
+     * exists somewhere before strtab_size does not mean one exists within
+     * PATH_BUF of runpath_off, and every downstream consumer of
+     * info->runpath (search_path_is_cacheable, etc.) scans it with
+     * unbounded xstrchrnul/xstrlen-style code. */
+    size_t remaining = info->strtab_size - runpath_off;
+    size_t bound = remaining < PATH_BUF ? remaining : PATH_BUF;
+    if (xmemchr(info->strtab + runpath_off, '\0', bound) == NULL) {
       return false;
     }
     info->runpath = info->strtab + runpath_off;

@@ -6,6 +6,25 @@ Scope: `nix-ld-cache/nix-ld-cache-audit.c`, `nix-ld-cache/nix-ld-cache-daemon.c`
 Status legend: **FIXED** / **PARTIAL** (gap remains) / **OPEN** / **NOT A BUG**.
 Line references are against the current tree. Both NixOS checks pass.
 
+**Stale since this review:** a later rewrite (protocol v3, stat-based
+write-scope cache invalidation) removed the peer-environment-capture
+subsystem this document describes. **C5** and **N1**, and the "Capability
+consequence" paragraph under **M5**, describe a
+`capture_peer_environment()`/`peer_still_alive()`/`SO_PEERPIDFD`-based
+liveness check reading `/proc/<pid>/environ`, gated by `CAP_DAC_READ_SEARCH |
+CAP_SYS_PTRACE` — none of that exists anymore. `conn->pid` (via
+`SO_PEERCRED`) is used only for debug logging now, the daemon reads zero
+`/proc/<pid>` files, and `module.nix` sets `CapabilityBoundingSet = [ "" ]`
+(no capabilities at all). The Test coverage note about the pre-6.5
+`SO_PEERPIDFD` fail-closed path is moot for the same reason. **C6**'s claim of
+a 1s `SO_SNDTIMEO` on the client socket is also stale — the client socket is
+fully non-blocking; only `connect()` is bounded, by a 200ms `ppoll()`. The
+Test coverage list's item 5 mislabels the "unavailable soname" subtest as
+guarding a `not-needed` reason — no such reason exists; it actually exercises
+`no-hit-in-search-paths`. All other findings (C1-C4, H1-H2, H5, N2-N3,
+M1-M2, M6-M8, S1-S2) still match current code, allowing for line-number
+drift.
+
 ## Critical
 
 ### C1. Daemon validation does not establish the resolution is genuine — FIXED

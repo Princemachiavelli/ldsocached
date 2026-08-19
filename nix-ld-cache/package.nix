@@ -4,7 +4,7 @@
   makeWrapper,
   strace,
   ripgrep,
-  enableAuditDebug ? false,
+  enableAuditDebug ? true,
   enableAuditDaemonless ? false,
 }:
 

@@ -48,7 +48,12 @@
         );
     in
     {
-      packages = forEachSupportedSystem (
+      # Linux-only: the package is an ELF/GNU-ld freestanding audit module
+      # plus an epoll/Linux-syscall daemon, neither of which can build (or
+      # mean anything) on Darwin. aarch64-darwin still gets devShells and a
+      # formatter below, and its VM checks build this via
+      # self.packages.aarch64-linux directly.
+      packages = forEachLinuxSystem (
         { pkgs, ... }:
         rec {
           default = nix-ld-cache;
@@ -58,7 +63,7 @@
 
       nixosModules = rec {
         default = nix-ld-cache;
-        nix-ld-cache = ./default.nix;
+        nix-ld-cache = ./module.nix;
       };
 
       checks =
@@ -66,7 +71,6 @@
           { pkgs, system }:
           let
             package = self.packages.${system}.default.override {
-              enableAuditDebug = true;
               enableAuditDaemonless = true;
             };
           in
@@ -100,7 +104,6 @@
                 config.allowUnfree = true;
               };
               package = self.packages.aarch64-linux.default.override {
-                enableAuditDebug = true;
                 enableAuditDaemonless = true;
               };
               # Fail loudly if HVF is ever unavailable instead of silently

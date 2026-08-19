@@ -540,32 +540,49 @@ search_path_is_cacheable(const char *search_path)
  * path. Following it is therefore safe and is what glibc does. What must not be
  * cached is the resolved target when it lands outside the store, since only the
  * store gives the immutability the cache assumes. */
-static bool
+enum soname_probe {
+  SONAME_ABSENT,
+  SONAME_SAFE,
+  SONAME_UNSAFE,
+};
+
+/* A directory can hold a regular file matching soname whose realpath()
+ * escapes the store (an attacker-built package can put anything it wants
+ * inside its own store paths). glibc does not care where a match resolves:
+ * it loads the first directory with a matching name, unconditionally. So an
+ * unsafe match here is not "not found" for search purposes -- it is exactly
+ * what glibc would have taken, and the caller must stop rather than keep
+ * looking at later directories, or it caches a directory glibc would never
+ * have reached. */
+static enum soname_probe
 directory_holds_soname(const char *dir, const char *soname)
 {
   char *candidate = NULL;
   if (asprintf(&candidate, "%s/%s", dir, soname) < 0) {
-    return false;
+    return SONAME_ABSENT;
   }
 
   struct stat st;
-  bool found = stat(candidate, &st) == 0 && S_ISREG(st.st_mode);
+  bool exists = stat(candidate, &st) == 0 && S_ISREG(st.st_mode);
+  enum soname_probe result = SONAME_ABSENT;
 
-  if (found) {
+  if (exists) {
     char *resolved = realpath(candidate, NULL);
-    found = resolved != NULL && path_is_safe_store_path(resolved);
+    result = (resolved != NULL && path_is_safe_store_path(resolved)) ? SONAME_SAFE : SONAME_UNSAFE;
     free(resolved);
   }
 
   free(candidate);
-  return found;
+  return result;
 }
 
 /* Walks a search path and returns the first directory holding the soname.
  * Returning the first hit is what makes the client's claim checkable: glibc
- * takes the same first hit, so any earlier match means the claim is wrong. */
+ * takes the same first hit, so any earlier match means the claim is wrong.
+ * Sets *unsafe and returns NULL if that first hit resolves outside the
+ * store: the caller must treat this as a hard stop, not as absence. */
 static char *
-first_hit_in_search_path(const char *search_path, const char *soname)
+first_hit_in_search_path(const char *search_path, const char *soname, bool *unsafe)
 {
   if (search_path == NULL) {
     return NULL;
@@ -578,13 +595,23 @@ first_hit_in_search_path(const char *search_path, const char *soname)
 
     if (len > 0) {
       char *dir = strndup(entry, len);
-      if (dir != NULL && directory_holds_soname(dir, soname)) {
-        char *hit = NULL;
-        if (asprintf(&hit, "%s/%s", dir, soname) < 0) {
-          hit = NULL;
+      if (dir != NULL) {
+        switch (directory_holds_soname(dir, soname)) {
+          case SONAME_SAFE: {
+            char *hit = NULL;
+            if (asprintf(&hit, "%s/%s", dir, soname) < 0) {
+              hit = NULL;
+            }
+            free(dir);
+            return hit;
+          }
+          case SONAME_UNSAFE:
+            free(dir);
+            *unsafe = true;
+            return NULL;
+          case SONAME_ABSENT:
+            break;
         }
-        free(dir);
-        return hit;
       }
       free(dir);
     }
@@ -845,8 +872,16 @@ static void
 commit_cache_entry(const char *cache_dir, const char *requester_path,
                    const char *ld_library_path, const char *soname, const char *path)
 {
-  if (mkdir_p(cache_dir) != 0) {
-    return;
+  /* mkdir_p is a handful of mkdir()+EEXIST syscalls; cache_dir does not
+   * disappear once created, so pay that cost at most once per daemon
+   * lifetime rather than on every commit -- this runs on every cache miss
+   * system-wide. */
+  static bool cache_dir_ready;
+  if (!cache_dir_ready) {
+    if (mkdir_p(cache_dir) != 0) {
+      return;
+    }
+    cache_dir_ready = true;
   }
 
   char *cache_path = cache_file_path(cache_dir, requester_path, ld_library_path);
@@ -926,6 +961,7 @@ derive_resolution(const char *requester_path, const char *soname,
   }
 
   char *hit = NULL;
+  bool unsafe_hit = false;
 
   if (!info.has_runpath) {
     debugf("reject reason=no-runpath requester=%s soname=%s", requester_path, soname);
@@ -948,11 +984,20 @@ derive_resolution(const char *requester_path, const char *soname,
              requester_path, soname);
       goto out;
     }
-    hit = first_hit_in_search_path(ld_library_path, soname);
+    hit = first_hit_in_search_path(ld_library_path, soname, &unsafe_hit);
   }
 
-  if (hit == NULL) {
-    hit = first_hit_in_search_path(info.runpath, soname);
+  if (hit == NULL && !unsafe_hit) {
+    hit = first_hit_in_search_path(info.runpath, soname, &unsafe_hit);
+  }
+
+  if (unsafe_hit) {
+    /* glibc's first match, in LD_LIBRARY_PATH or RUNPATH, resolves outside
+     * the store. That is what glibc would have loaded (or failed on); a
+     * later directory's safe match is not what actually happens and must
+     * not be cached in its place. */
+    debugf("reject reason=unsafe-search-hit requester=%s soname=%s", requester_path, soname);
+    goto out;
   }
 
   if (hit == NULL) {
@@ -984,13 +1029,15 @@ process_message(struct connection *conn, const char *cache_dir)
   const char *soname = requester_path + conn->header.requester_len + 1;
   const char *ld_library_path = soname + conn->header.soname_len + 1;
 
-  if (!path_is_safe_store_path(requester_path)
-      || !field_is_safe_soname(soname)
-      || (ld_library_path[0] != '\0' && !search_path_is_cacheable(ld_library_path))) {
+  if (!path_is_safe_store_path(requester_path) || !field_is_safe_soname(soname)) {
     debugf("reject reason=invalid-fields pid=%ld", (long) conn->pid);
     return;
   }
 
+  /* ld_library_path's cacheability is derive_resolution()'s own invariant
+   * (checked there, with a specific reject reason) -- not re-checked here,
+   * so that check stays the single point of truth instead of being shadowed
+   * by a coarser one that fires first. */
   char *resolved = derive_resolution(requester_path, soname, ld_library_path);
   if (resolved == NULL) {
     return;

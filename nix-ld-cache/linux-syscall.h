@@ -24,7 +24,6 @@
 #define LNX_SYS_socket 41
 #define LNX_SYS_connect 42
 #define LNX_SYS_sendto 44
-#define LNX_SYS_setsockopt 54
 #define LNX_SYS_getsockopt 55
 #define LNX_SYS_getuid 102
 #define LNX_SYS_futex 202
@@ -89,7 +88,6 @@ struct lnx_stat {
 #define LNX_SYS_socket 198
 #define LNX_SYS_connect 203
 #define LNX_SYS_sendto 206
-#define LNX_SYS_setsockopt 208
 #define LNX_SYS_getsockopt 209
 #define LNX_SYS_munmap 215
 #define LNX_SYS_mmap 222
