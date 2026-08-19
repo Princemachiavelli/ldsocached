@@ -1,5 +1,12 @@
 # nix-ld-cache
 
+## AI Disclosure
+This is 99% AI built. The only justification for this code is that it solves
+a problem (stat storm caused by dynamic libraries) and does not require a
+Nixpkgs rebuild or upstream PR. It is much worse than the other proposals and
+could even have security issues.
+
+## Overview
 `nix-ld-cache` is an `LD_AUDIT` module plus a privileged cache writer that
 caches successful `DT_NEEDED` resolutions for Nix-style immutable store paths.
 
