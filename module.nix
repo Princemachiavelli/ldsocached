@@ -14,8 +14,19 @@ let
   # shared group must not collide with it (that fails at step USER with
   # "User or group with specified name already exists").
   cacheGroup = "nix-ld-cache-readers";
+  # Stable path for long-lived contexts that see the full host filesystem
+  # (login sessions, other systemd units): survives a generation switch
+  # without needing a restart, since it always points at the current
+  # profile's package.
   auditLibraryPath = "/run/current-system/sw/lib/nix-ld-cache.so";
   execInjectLibraryPath = "/run/current-system/sw/lib/nix-ld-cache-execinject.so";
+  # The real store file, not the `nix-ld-cache.so` alias: sandboxed builds
+  # only ever see a curated, per-build /nix/store, and Nix's chroot setup
+  # cannot bind-mount a symlink -- it recreates the same symlink inside the
+  # chroot instead of dereferencing it (linux-derivation-builder.cc), which
+  # would leave it dangling unless its target is *also* granted. Using the
+  # real path sidesteps that: nothing left to separately grant.
+  auditLibraryStorePath = "${cfg.package}/lib/libnix-ld-cache-audit.so";
   auditEnvironment = {
     LD_AUDIT = auditLibraryPath;
     NIX_LD_AUDIT_CACHE_DIR = cfg.cacheDir;
@@ -28,6 +39,14 @@ let
   auditEnvironmentString = lib.concatStringsSep " " (
     lib.mapAttrsToList (name: value: "${name}=${lib.escapeShellArg value}") auditEnvironment
   );
+  # nix-daemon's own environment, separate from auditEnvironment above: this
+  # is also what our execve() interposer reads (via
+  # daemonExecInjectEnvironment) to inject into sandboxed builds, which
+  # cannot resolve the /run/current-system symlink, so LD_AUDIT here must be
+  # the real store path instead of the stable alias.
+  daemonAuditEnvironment = auditEnvironment // {
+    LD_AUDIT = auditLibraryStorePath;
+  };
   # nix-daemon's own execve() interposer (nix-ld-cache-exec-inject.c) reads
   # this to know which of its own env vars to splice into every process it
   # launches, sandboxed builds included -- nix.conf's impure-env only ever
@@ -117,17 +136,19 @@ in
     nix.settings = lib.mkIf cfg.nixSandboxIntegration {
       # Bind-mounted into every sandboxed build's chroot so the builder
       # process (once execve() has the LD_AUDIT env var, see
-      # daemonExecInjectEnvironment below) can actually open the audit
-      # module and reach the daemon socket from inside the sandbox.
+      # daemonAuditEnvironment above) can actually open the audit module and
+      # reach the daemon socket from inside the sandbox. The audit module
+      # must be the real store path (auditLibraryStorePath), not the
+      # auditLibraryPath alias: see its definition above.
       extra-sandbox-paths = [
         cfg.cacheDir
-        auditLibraryPath
+        auditLibraryStorePath
         "/run/${runtimeName}"
       ];
     };
 
     systemd.services.nix-daemon.environment = lib.mkIf cfg.nixSandboxIntegration (
-      auditEnvironment // daemonExecInjectEnvironment
+      daemonAuditEnvironment // daemonExecInjectEnvironment
     );
 
     systemd.services.nix-ld-cache = {
