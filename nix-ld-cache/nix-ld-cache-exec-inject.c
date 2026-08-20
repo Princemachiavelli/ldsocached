@@ -37,8 +37,10 @@
  * module.nix stays the single source of truth for the variable set). */
 #define INJECT_VARS_ENV "NIX_LD_CACHE_INJECT_VARS"
 
+/* Signature of libc's execve(). */
 typedef int (*execve_fn)(const char *, char *const[], char *const[]);
 
+/* Resolves (and caches) the real, non-interposed execve() via dlsym(). */
 static execve_fn real_execve(void) {
     static execve_fn fn = NULL;
     if (fn == NULL) {
@@ -47,6 +49,7 @@ static execve_fn real_execve(void) {
     return fn;
 }
 
+/* Length of a NULL-terminated envp array, excluding the terminator. */
 static size_t envp_len(char *const envp[]) {
     size_t n = 0;
     while (envp != NULL && envp[n] != NULL) {
@@ -55,6 +58,7 @@ static size_t envp_len(char *const envp[]) {
     return n;
 }
 
+/* Reports whether envp already has an entry named name. */
 static bool envp_has(char *const envp[], const char *name, size_t name_len) {
     for (size_t i = 0; envp != NULL && envp[i] != NULL; i++) {
         if (strncmp(envp[i], name, name_len) == 0 && envp[i][name_len] == '=') {

@@ -61,11 +61,13 @@
 #define NIX_LAV_CURRENT 2u
 #define LNX_LA_SER_ORIG 0x01u
 
+/* ELF64 Elf64_Dyn: one PT_DYNAMIC entry (tag, value-or-pointer union). */
 struct lnx_elf64_dyn {
   int64_t d_tag;
   uint64_t d_un;
 };
 
+/* ELF64 file header. */
 struct lnx_elf64_ehdr {
   unsigned char e_ident[16];
   uint16_t e_type;
@@ -83,6 +85,7 @@ struct lnx_elf64_ehdr {
   uint16_t e_shstrndx;
 };
 
+/* ELF64 program header. */
 struct lnx_elf64_phdr {
   uint32_t p_type;
   uint32_t p_flags;
@@ -116,6 +119,8 @@ struct scope_cache {
   uint64_t last_used;
 };
 
+/* Parsed DT_RUNPATH/DT_RPATH/soname fields from a requester's PT_DYNAMIC
+ * section. */
 struct dynamic_info {
   const char *strtab;
   size_t strtab_size;
@@ -125,6 +130,8 @@ struct dynamic_info {
   bool has_runpath;
 };
 
+/* Bounded string builder over a caller-owned buffer. Overflow truncates and
+ * clears ok; callers building paths must check ok before using the result. */
 struct sbuf {
   char *data;
   size_t cap;
@@ -191,6 +198,7 @@ memcmp(const void *left, const void *right, size_t n)
   return 0;
 }
 
+/* strlen() without libc. */
 static size_t
 xstrlen(const char *s)
 {
@@ -201,6 +209,7 @@ xstrlen(const char *s)
   return (size_t) (p - s);
 }
 
+/* strcmp() without libc. */
 static int
 xstrcmp(const char *left, const char *right)
 {
@@ -211,6 +220,7 @@ xstrcmp(const char *left, const char *right)
   return (unsigned char) *left - (unsigned char) *right;
 }
 
+/* strchr() without libc. */
 static const char *
 xstrchr(const char *s, char c)
 {
@@ -222,6 +232,7 @@ xstrchr(const char *s, char c)
   return NULL;
 }
 
+/* strchrnul() without libc. */
 static const char *
 xstrchrnul(const char *s, char c)
 {
@@ -233,6 +244,7 @@ xstrchrnul(const char *s, char c)
   return s;
 }
 
+/* memchr() without libc. */
 static const char *
 xmemchr(const char *s, char c, size_t n)
 {
@@ -244,6 +256,7 @@ xmemchr(const char *s, char c, size_t n)
   return NULL;
 }
 
+/* Reports whether value begins with prefix. */
 static bool
 starts_with(const char *value, const char *prefix)
 {
@@ -255,6 +268,8 @@ starts_with(const char *value, const char *prefix)
   return true;
 }
 
+/* Copies src into dst (capacity cap) if it fits with its NUL; false if it
+ * would overflow. */
 static bool
 copy_str_bounded(char *dst, size_t cap, const char *src)
 {
@@ -280,6 +295,8 @@ sbuf_init(struct sbuf *b, char *data, size_t cap)
   }
 }
 
+/* Appends n bytes from s, truncating (and clearing b->ok) if they do not
+ * fit. */
 static void
 sbuf_putn(struct sbuf *b, const char *s, size_t n)
 {
@@ -297,12 +314,14 @@ sbuf_putn(struct sbuf *b, const char *s, size_t n)
   b->data[b->len] = '\0';
 }
 
+/* Appends a NUL-terminated string. */
 static void
 sbuf_puts(struct sbuf *b, const char *s)
 {
   sbuf_putn(b, s, xstrlen(s));
 }
 
+/* Appends value as 16 lowercase hex digits, zero-padded. */
 static void
 sbuf_put_hex16(struct sbuf *b, uint64_t value)
 {
@@ -314,6 +333,7 @@ sbuf_put_hex16(struct sbuf *b, uint64_t value)
   sbuf_putn(b, tmp, sizeof(tmp));
 }
 
+/* Appends value in decimal, no padding. */
 static void
 sbuf_put_dec(struct sbuf *b, uint64_t value)
 {
@@ -334,6 +354,7 @@ atomic_cmpxchg(int *ptr, int expected, int desired)
   return expected;
 }
 
+/* Locks lock, blocking via futex WAIT while contended. */
 static void
 mutex_lock(int *lock)
 {
@@ -350,6 +371,7 @@ mutex_lock(int *lock)
   }
 }
 
+/* Unlocks lock, waking one waiter via futex WAKE if it was contended. */
 static void
 mutex_unlock(int *lock)
 {
@@ -363,6 +385,8 @@ mutex_unlock(int *lock)
 static char *arena_next;
 static size_t arena_left;
 
+/* Allocates n never-freed bytes from the arena, mmap'ing a new chunk if the
+ * current one is exhausted. */
 static char *
 arena_alloc(size_t n)
 {
@@ -385,6 +409,7 @@ arena_alloc(size_t n)
   return out;
 }
 
+/* strdup() onto the never-freed arena. */
 static char *
 arena_strdup(const char *value)
 {
@@ -404,6 +429,8 @@ static char *env_data;
 static size_t env_len;
 static int env_once; /* 0 not loaded, 1 loading, 2 loaded */
 
+/* Reads /proc/self/environ into env_data/env_len. Leaves them NULL/0 (module
+ * goes inert for cache purposes) on any read error or truncation. */
 static void
 env_load(void)
 {
@@ -448,6 +475,8 @@ env_load(void)
   env_len = len;
 }
 
+/* Ensures the environment snapshot is loaded exactly once, letting concurrent
+ * callers block on the same load instead of racing it. */
 static void
 env_ensure(void)
 {
@@ -493,7 +522,8 @@ env_get(const char *name)
   return NULL;
 }
 
-/* Unused when both debug logging and daemonless mode are compiled out. */
+/* Writes all of buf to fd, retrying on EINTR and short writes. Unused when
+ * both debug logging and daemonless mode are compiled out. */
 __attribute__((unused)) static long
 write_full(long fd, const void *buf, size_t len)
 {
@@ -579,6 +609,8 @@ debugf(const char *fmt, ...)
 #endif
 }
 
+/* FNV-1a 64-bit, folded over successive calls so the scope key never has to
+ * be materialized as one string. */
 static uint64_t
 fnv1a64_update(uint64_t hash, const char *value)
 {
@@ -590,12 +622,16 @@ fnv1a64_update(uint64_t hash, const char *value)
   return hash;
 }
 
+/* Reports whether path is non-NULL and starts with '/'. */
 static bool
 path_is_absolute(const char *path)
 {
   return path != NULL && path[0] == '/';
 }
 
+/* Reports whether path[0..len) is a store path safe to trust and cache:
+ * under STORE_PREFIX, free of ".."/"." traversal components, and free of
+ * TSV-breaking characters. */
 static bool
 span_is_safe_store_path(const char *path, size_t len)
 {
@@ -632,6 +668,7 @@ span_is_safe_store_path(const char *path, size_t len)
   return true;
 }
 
+/* span_is_safe_store_path() for a NUL-terminated string. */
 static bool
 path_is_safe_store_path(const char *path)
 {
@@ -668,6 +705,7 @@ search_path_is_cacheable(const char *search_path)
   return true;
 }
 
+/* Reports whether the current process's LD_LIBRARY_PATH (if any) is cacheable. */
 static bool
 environment_is_cacheable(void)
 {
@@ -741,6 +779,8 @@ requester_identity(uintptr_t cookie_value, char out[PATH_BUF])
   return true;
 }
 
+/* Parses cookie_value's already-mapped link_map for RUNPATH/RPATH presence
+ * and the RUNPATH string, walking its live (relocated) PT_DYNAMIC entries. */
 static bool
 parse_mapped_dynamic_info(uintptr_t cookie_value, struct dynamic_info *info)
 {
@@ -825,6 +865,9 @@ requester_runpath_cacheable(uintptr_t cookie_value)
   return info.has_runpath && !info.has_rpath && search_path_is_cacheable(info.runpath);
 }
 
+/* Appends the configured (or default per-user) cache root to b:
+ * NIX_LD_AUDIT_CACHE_DIR, else $XDG_CACHE_HOME/nix-ld-cache, else
+ * $HOME/.cache/nix-ld-cache, else /var/tmp/nix-ld-cache-audit-<uid>. */
 static bool
 cache_dir(struct sbuf *b)
 {
@@ -879,12 +922,15 @@ cache_file_path(char out[CACHE_PATH_BUF], const char *requester_path, const char
   return b.ok;
 }
 
+/* Reports whether path is absolute and currently readable. */
 static bool
 file_exists_readable(const char *path)
 {
   return path_is_absolute(path) && lnx_faccessat(LNX_AT_FDCWD, path, LNX_R_OK) == 0;
 }
 
+/* Opens and mmaps path as a regular file. stat_out, if non-NULL, receives
+ * the fstat() used to validate it. */
 static bool
 map_file(const char *path, const char **data_out, size_t *len_out, struct lnx_stat *stat_out)
 {
@@ -919,6 +965,7 @@ map_file(const char *path, const char **data_out, size_t *len_out, struct lnx_st
   return true;
 }
 
+/* Unmaps a mapping returned by map_file(). */
 static void
 unmap_file(const char *data, size_t len)
 {
@@ -927,6 +974,7 @@ unmap_file(const char *data, size_t len)
   }
 }
 
+/* Unmaps cache's file and clears the slot to unused. */
 static void
 scope_cache_reset(struct scope_cache *cache)
 {
@@ -934,6 +982,8 @@ scope_cache_reset(struct scope_cache *cache)
   memset(cache, 0, sizeof(*cache));
 }
 
+/* Reports whether two stat results describe the same file identity and
+ * content (device, inode, size, mtime, ctime). */
 static bool
 stat_matches(const struct lnx_stat *left, const struct lnx_stat *right)
 {
@@ -946,6 +996,7 @@ stat_matches(const struct lnx_stat *left, const struct lnx_stat *right)
     && left->st_ctime_nsec == right->st_ctime_nsec;
 }
 
+/* Reports whether cache's mapped file is still the current on-disk file. */
 static bool
 scope_cache_current(const struct scope_cache *cache)
 {
@@ -956,6 +1007,8 @@ scope_cache_current(const struct scope_cache *cache)
     && stat_matches(&cache->file_stat, &st);
 }
 
+/* Returns the live cache slot for (requester_path, ld_library_path), or NULL
+ * if not cached. */
 static struct scope_cache *
 scope_cache_find(const char *requester_path, const char *ld_library_path)
 {
@@ -972,6 +1025,8 @@ scope_cache_find(const char *requester_path, const char *ld_library_path)
   return NULL;
 }
 
+/* Picks the slot to evict for a new entry: an empty slot if one exists,
+ * otherwise the least-recently-used one. */
 static struct scope_cache *
 scope_cache_victim(void)
 {
@@ -1107,11 +1162,15 @@ lookup_cache_entry(const char *requester_path, const char *soname, char out[PATH
 }
 
 #if NIX_LD_AUDIT_ENABLE_DAEMONLESS
+/* An mmap'd ELF file, read directly from disk (daemonless mode has no
+ * already-relocated link_map to read a requester's own dynamic section
+ * from). */
 struct elf_image {
   const char *data;
   size_t size;
 };
 
+/* strrchr() without libc. */
 static const char *
 xstrrchr(const char *s, char c)
 {
@@ -1124,6 +1183,8 @@ xstrrchr(const char *s, char c)
   return last;
 }
 
+/* Reports whether soname is a plain filename: non-empty, no path separator,
+ * no TSV-breaking characters. */
 static bool
 field_is_safe_soname(const char *soname)
 {
@@ -1134,6 +1195,7 @@ field_is_safe_soname(const char *soname)
     && xstrchr(soname, '\t') == NULL;
 }
 
+/* Reports whether buf's TSV contents already have a "soname\tpath" line. */
 static bool
 tsv_contains(const char *buf, size_t len, const char *soname, const char *path)
 {
@@ -1164,6 +1226,7 @@ tsv_contains(const char *buf, size_t len, const char *soname, const char *path)
   return false;
 }
 
+/* Creates path and any missing parent directories (like `mkdir -p`). */
 static long
 mkdir_p(const char *path)
 {
@@ -1189,6 +1252,7 @@ mkdir_p(const char *path)
   return (rc == 0 || rc == -LNX_EEXIST) ? 0 : -1;
 }
 
+/* Unmaps an image loaded by load_elf_image() and zeroes it. */
 static void
 unload_elf_image(struct elf_image *image)
 {
@@ -1197,6 +1261,7 @@ unload_elf_image(struct elf_image *image)
   image->size = 0;
 }
 
+/* Opens and mmaps path as a regular file, if it is a safe store path. */
 static bool
 load_elf_image(const char *path, struct elf_image *image)
 {
@@ -1222,12 +1287,15 @@ load_elf_image(const char *path, struct elf_image *image)
   return true;
 }
 
+/* Reports whether the byte range [off, off+size) lies within image. */
 static bool
 elf_bounds_ok(const struct elf_image *image, size_t off, size_t size)
 {
   return off <= image->size && size <= image->size - off;
 }
 
+/* Translates a virtual address to a file offset via the PT_LOAD program
+ * headers; false if vaddr is not covered by any of them. */
 static bool
 vaddr_to_offset(const struct elf_image *image, const struct lnx_elf64_phdr *phdrs, size_t phnum,
                 uint64_t vaddr, size_t *offset_out)
@@ -1255,6 +1323,11 @@ vaddr_to_offset(const struct elf_image *image, const struct lnx_elf64_phdr *phdr
   return false;
 }
 
+/* Parses image's PT_DYNAMIC section into info (soname and, via strtab, the
+ * data span_is_safe_store_path-style checks need); false if the ELF is
+ * malformed or truncated. Unlike parse_mapped_dynamic_info, bounds are
+ * checked against the actual mapped file size, since this reads straight
+ * from disk rather than a trusted, already-relocated link_map. */
 static bool
 parse_file_dynamic_info(const struct elf_image *image, struct dynamic_info *info)
 {
@@ -1338,6 +1411,8 @@ parse_file_dynamic_info(const struct elf_image *image, struct dynamic_info *info
   return true;
 }
 
+/* Reports whether the ELF file at path is soname: matched by its DT_SONAME
+ * if present, otherwise by its filename. */
 static bool
 soname_matches(const char *path, const char *soname)
 {
@@ -1361,6 +1436,8 @@ soname_matches(const char *path, const char *soname)
   return match;
 }
 
+/* Reports whether candidate is a regular file that resolves inside the
+ * store. */
 static bool
 candidate_is_safe_store_file(const char *candidate)
 {
@@ -1373,6 +1450,8 @@ candidate_is_safe_store_file(const char *candidate)
   return resolve_realpath(candidate, resolved) && path_is_safe_store_path(resolved);
 }
 
+/* Walks a search path and writes the first "<dir>/<soname>" that is a safe
+ * store file into out; false if none matches. */
 static bool
 first_hit_in_search_path(const char *search_path, const char *soname, char out[PATH_BUF])
 {
@@ -1405,6 +1484,10 @@ first_hit_in_search_path(const char *search_path, const char *soname, char out[P
   return false;
 }
 
+/* Daemonless equivalent of the daemon's derive_resolution(): re-derives a
+ * resolution for (requester, soname) locally from the requester's own
+ * DT_RUNPATH and LD_LIBRARY_PATH, under the same safety rules, and writes it
+ * to out on success. */
 static bool
 derive_resolution(uintptr_t cookie_value, const char *requester_path, const char *soname,
                   char out[PATH_BUF])
@@ -1468,6 +1551,8 @@ derive_resolution(uintptr_t cookie_value, const char *requester_path, const char
   return true;
 }
 
+/* Reports whether the on-disk cache file at cache_path already has a
+ * "soname\tpath" line. */
 static bool
 disk_cache_contains_line(const char *cache_path, const char *soname, const char *path)
 {
@@ -1482,6 +1567,9 @@ disk_cache_contains_line(const char *cache_path, const char *soname, const char 
   return found;
 }
 
+/* Appends a derived (soname -> path) resolution to the on-disk per-scope
+ * cache file for requester_path, creating the cache directory and file as
+ * needed, unless it is already present. */
 static long
 commit_daemonless_cache_entry(const char *requester_path, const char *soname, const char *path)
 {
@@ -1541,6 +1629,8 @@ commit_daemonless_cache_entry(const char *requester_path, const char *soname, co
   return rc;
 }
 
+/* Evicts any in-memory scope_cache entries for requester_path, so the next
+ * lookup re-reads the file this process itself just appended to. */
 static void
 invalidate_scope_cache(const char *requester_path)
 {
@@ -1554,6 +1644,7 @@ invalidate_scope_cache(const char *requester_path)
   mutex_unlock(&state_lock);
 }
 
+/* Reports whether NIX_LD_AUDIT_DAEMONLESS is set to a truthy value. */
 static bool
 daemonless_enabled(void)
 {
@@ -1561,6 +1652,9 @@ daemonless_enabled(void)
   return value != NULL && value[0] != '\0' && xstrcmp(value, "0") != 0;
 }
 
+/* Daemonless path for submit_cache_entry(): derives a resolution locally and,
+ * on success, commits it to the per-user disk cache and invalidates the
+ * in-memory scope so this process sees its own write immediately. */
 static long
 submit_daemonless_cache_entry(uintptr_t cookie_value, const char *requester_path, const char *soname)
 {
@@ -1689,6 +1783,8 @@ submit_cache_entry(uintptr_t cookie_value, const char *requester_path, const cha
   return rc;
 }
 
+/* rtld-audit ABI entry point: glibc calls this once at load time to
+ * negotiate the audit protocol version. */
 __attribute__((visibility("default"))) unsigned int
 la_version(unsigned int version)
 {
@@ -1697,6 +1793,10 @@ la_version(unsigned int version)
   return version < NIX_LAV_CURRENT ? version : NIX_LAV_CURRENT;
 }
 
+/* rtld-audit ABI entry point: glibc calls this for every no-slash soname
+ * lookup. Serves a cached resolution on a hit; otherwise returns name
+ * unchanged (so glibc's normal search proceeds) and reports the miss to the
+ * daemon for future lookups. */
 __attribute__((visibility("default"))) char *
 la_objsearch(const char *name, uintptr_t *cookie, unsigned int flag)
 {

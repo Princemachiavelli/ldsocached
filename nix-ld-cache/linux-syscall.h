@@ -34,6 +34,8 @@
 #define LNX_SYS_faccessat 269
 #define LNX_SYS_ppoll 271
 
+/* Issues Linux syscall nr with up to six arguments; returns the raw kernel
+ * result (>= 0 on success, -errno on failure). */
 static inline long
 lnx_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
 {
@@ -92,6 +94,8 @@ struct lnx_stat {
 #define LNX_SYS_munmap 215
 #define LNX_SYS_mmap 222
 
+/* Issues Linux syscall nr with up to six arguments; returns the raw kernel
+ * result (>= 0 on success, -errno on failure). */
 static inline long
 lnx_syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
 {
@@ -178,100 +182,117 @@ struct lnx_stat {
 #define LNX_EEXIST 17
 #define LNX_EINPROGRESS 115
 
+/* AF_UNIX socket address; sun_path is used only as a NUL-terminated string. */
 struct lnx_sockaddr_un {
   unsigned short sun_family;
   char sun_path[108];
 };
 
+/* One fd's request/result flags for lnx_ppoll(). */
 struct lnx_pollfd {
   int fd;
   short events;
   short revents;
 };
 
+/* Seconds/nanoseconds duration or deadline, as used by lnx_ppoll(). */
 struct lnx_timespec {
   long tv_sec;
   long tv_nsec;
 };
 
+/* Raw read(2). */
 static inline long
 lnx_read(long fd, void *buf, size_t count)
 {
   return lnx_syscall6(LNX_SYS_read, fd, (long) buf, (long) count, 0, 0, 0);
 }
 
+/* Raw write(2). */
 static inline long
 lnx_write(long fd, const void *buf, size_t count)
 {
   return lnx_syscall6(LNX_SYS_write, fd, (long) buf, (long) count, 0, 0, 0);
 }
 
+/* Raw close(2). */
 static inline long
 lnx_close(long fd)
 {
   return lnx_syscall6(LNX_SYS_close, fd, 0, 0, 0, 0, 0);
 }
 
+/* Raw openat(2). */
 static inline long
 lnx_openat(long dirfd, const char *path, long flags, long mode)
 {
   return lnx_syscall6(LNX_SYS_openat, dirfd, (long) path, flags, mode, 0, 0);
 }
 
+/* Raw fstat(2). */
 static inline long
 lnx_fstat(long fd, struct lnx_stat *st)
 {
   return lnx_syscall6(LNX_SYS_fstat, fd, (long) st, 0, 0, 0, 0);
 }
 
+/* Raw newfstatat(2) (the modern fstatat(2)/lstat(2) backend). */
 static inline long
 lnx_newfstatat(long dirfd, const char *path, struct lnx_stat *st, long flags)
 {
   return lnx_syscall6(LNX_SYS_newfstatat, dirfd, (long) path, (long) st, flags, 0, 0);
 }
 
+/* Raw readlinkat(2). */
 static inline long
 lnx_readlinkat(long dirfd, const char *path, char *buf, size_t bufsiz)
 {
   return lnx_syscall6(LNX_SYS_readlinkat, dirfd, (long) path, (long) buf, (long) bufsiz, 0, 0);
 }
 
+/* Raw faccessat(2). */
 static inline long
 lnx_faccessat(long dirfd, const char *path, long mode)
 {
   return lnx_syscall6(LNX_SYS_faccessat, dirfd, (long) path, mode, 0, 0, 0);
 }
 
+/* Raw mkdirat(2). */
 static inline long
 lnx_mkdirat(long dirfd, const char *path, long mode)
 {
   return lnx_syscall6(LNX_SYS_mkdirat, dirfd, (long) path, mode, 0, 0, 0);
 }
 
+/* Raw socket(2). */
 static inline long
 lnx_socket(long family, long type, long protocol)
 {
   return lnx_syscall6(LNX_SYS_socket, family, type, protocol, 0, 0, 0);
 }
 
+/* Raw connect(2). */
 static inline long
 lnx_connect(long fd, const struct lnx_sockaddr_un *addr, size_t addrlen)
 {
   return lnx_syscall6(LNX_SYS_connect, fd, (long) addr, (long) addrlen, 0, 0, 0);
 }
 
+/* Raw sendto(2). */
 static inline long
 lnx_sendto(long fd, const void *buf, size_t len, long flags)
 {
   return lnx_syscall6(LNX_SYS_sendto, fd, (long) buf, (long) len, flags, 0, 0);
 }
 
+/* Raw getsockopt(2). */
 static inline long
 lnx_getsockopt(long fd, long level, long optname, void *optval, unsigned int *optlen)
 {
   return lnx_syscall6(LNX_SYS_getsockopt, fd, level, optname, (long) optval, (long) optlen, 0);
 }
 
+/* Raw ppoll(2) with a NULL signal mask. */
 static inline long
 lnx_ppoll(struct lnx_pollfd *fds, unsigned long nfds, const struct lnx_timespec *timeout)
 {
@@ -279,7 +300,7 @@ lnx_ppoll(struct lnx_pollfd *fds, unsigned long nfds, const struct lnx_timespec 
   return lnx_syscall6(LNX_SYS_ppoll, (long) fds, (long) nfds, (long) timeout, 0, 8, 0);
 }
 
-/* Returns NULL on failure instead of MAP_FAILED. */
+/* Raw mmap(2). Returns NULL on failure instead of MAP_FAILED. */
 static inline void *
 lnx_mmap(void *addr, size_t len, long prot, long flags, long fd, long offset)
 {
@@ -290,18 +311,22 @@ lnx_mmap(void *addr, size_t len, long prot, long flags, long fd, long offset)
   return (void *) rc;
 }
 
+/* Raw munmap(2). */
 static inline long
 lnx_munmap(void *addr, size_t len)
 {
   return lnx_syscall6(LNX_SYS_munmap, (long) addr, (long) len, 0, 0, 0, 0);
 }
 
+/* Raw getuid(2). */
 static inline long
 lnx_getuid(void)
 {
   return lnx_syscall6(LNX_SYS_getuid, 0, 0, 0, 0, 0, 0);
 }
 
+/* Raw futex(2), WAIT/WAKE ops only (as used by the mutex above it in
+ * nix-ld-cache-audit.c). */
 static inline long
 lnx_futex(int *uaddr, long op, long val, const struct lnx_timespec *timeout)
 {

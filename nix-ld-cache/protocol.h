@@ -8,7 +8,11 @@
 #define NIX_LD_CACHE_PROTOCOL_VERSION 3u
 #define NIX_LD_CACHE_PROTOCOL_MAX_FIELD 4096u
 
-/* The client sends the cache scope, not the resolved path. The daemon still
+/* Fixed-size header of one wire message: a client's cache lookup/learn
+ * request, followed by requester_len + soname_len + ld_library_path_len
+ * bytes of concatenated field data.
+ *
+ * The client sends the cache scope, not the resolved path. The daemon still
  * derives the resolution and validates store-only search paths before writing. */
 struct nix_ld_cache_msg {
   uint32_t magic;

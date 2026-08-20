@@ -33,11 +33,13 @@
 static volatile sig_atomic_t stop_requested;
 static bool debug_logging;
 
+/* Read state of a connection's in-progress request. */
 enum conn_state {
   CONN_READ_HEADER,
   CONN_READ_PAYLOAD,
 };
 
+/* State for one in-progress or idle client connection. */
 struct connection {
   int fd;
   pid_t pid;
@@ -51,11 +53,13 @@ struct connection {
   size_t payload_got;
 };
 
+/* An mmap'd ELF file. */
 struct elf_image {
   void *data;
   size_t size;
 };
 
+/* Parsed contents of an ELF file's PT_DYNAMIC section. */
 struct dynamic_info {
   const char *strtab;
   size_t strtab_size;
@@ -67,6 +71,8 @@ struct dynamic_info {
   size_t needed_count;
 };
 
+/* In-memory mirror of one on-disk scope cache file (<hash>.tsv), keyed by
+ * cache_path. */
 struct write_scope_cache {
   char *cache_path;
   char *file_contents;
@@ -85,6 +91,8 @@ struct write_scope_cache {
 static struct write_scope_cache write_scope_caches[WRITE_SCOPE_CACHE_CAP];
 static uint64_t write_scope_cache_tick;
 
+/* Signal handler for SIGINT/SIGTERM: requests a clean shutdown from the main
+ * epoll loop. */
 static void
 handle_signal(int signo)
 {
@@ -92,8 +100,11 @@ handle_signal(int signo)
   stop_requested = 1;
 }
 
+/* See definition below. */
 static bool path_is_safe_store_path(const char *path);
 
+/* Prints a debug-only, prefixed log line to stderr when debug_logging is
+ * set. */
 static void
 debugf(const char *fmt, ...)
 {
@@ -111,6 +122,7 @@ debugf(const char *fmt, ...)
   va_end(ap);
 }
 
+/* FNV-1a 64-bit hash of a NUL-terminated string, used to name cache files. */
 static uint64_t
 fnv1a64(const char *value)
 {
@@ -124,6 +136,7 @@ fnv1a64(const char *value)
   return hash;
 }
 
+/* Current monotonic time in milliseconds. */
 static uint64_t
 now_ms(void)
 {
@@ -132,6 +145,7 @@ now_ms(void)
   return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
 }
 
+/* strdup() that returns NULL for a NULL input instead of crashing. */
 static char *
 xstrdup(const char *value)
 {
@@ -147,12 +161,14 @@ xstrdup(const char *value)
   return copy;
 }
 
+/* Reports whether value begins with prefix. */
 static bool
 starts_with(const char *value, const char *prefix)
 {
   return strncmp(value, prefix, strlen(prefix)) == 0;
 }
 
+/* Creates path and any missing parent directories (like `mkdir -p`). */
 static int
 mkdir_p(const char *path)
 {
@@ -187,6 +203,7 @@ mkdir_p(const char *path)
   return 0;
 }
 
+/* Writes all of buf, retrying on short writes and EINTR. */
 static int
 write_full(int fd, const void *buf, size_t len)
 {
@@ -207,7 +224,9 @@ write_full(int fd, const void *buf, size_t len)
   return 0;
 }
 
-/* A store path is immutable and hash-addressed, so anything verified about its
+/* Reports whether path is a store path safe to trust and cache.
+ *
+ * A store path is immutable and hash-addressed, so anything verified about its
  * contents stays true. Traversal components would escape that guarantee, and
  * tabs or newlines would corrupt the TSV cache format. */
 static bool
@@ -241,6 +260,8 @@ path_is_safe_store_path(const char *path)
   return true;
 }
 
+/* Reports whether soname is a plain filename: non-empty, no path separator,
+ * no TSV-breaking characters. */
 static bool
 field_is_safe_soname(const char *soname)
 {
@@ -251,6 +272,7 @@ field_is_safe_soname(const char *soname)
     && strchr(soname, '\t') == NULL;
 }
 
+/* Frees info's owned allocations and zeroes it. */
 static void
 free_dynamic_info(struct dynamic_info *info)
 {
@@ -258,6 +280,7 @@ free_dynamic_info(struct dynamic_info *info)
   memset(info, 0, sizeof(*info));
 }
 
+/* Unmaps an image loaded by load_elf_image() and zeroes it. */
 static void
 unload_elf_image(struct elf_image *image)
 {
@@ -268,7 +291,9 @@ unload_elf_image(struct elf_image *image)
   image->size = 0;
 }
 
-/* Always resolved against the daemon's own root. Reading through
+/* Opens and mmaps path as a regular file, if it is a safe store path.
+ *
+ * Always resolved against the daemon's own root. Reading through
  * /proc/<pid>/root would let a client bind-mount over a store path inside an
  * unprivileged mount namespace and forge the ELF metadata being verified.
  *
@@ -311,12 +336,15 @@ load_elf_image(const char *path, struct elf_image *image)
   return true;
 }
 
+/* Reports whether the byte range [off, off+size) lies within image. */
 static bool
 elf_bounds_ok(const struct elf_image *image, size_t off, size_t size)
 {
   return off <= image->size && size <= image->size - off;
 }
 
+/* Translates a virtual address to a file offset via the PT_LOAD program
+ * headers; false if vaddr is not covered by any of them. */
 static bool
 vaddr_to_offset(const struct elf_image *image, const Elf64_Phdr *phdrs, size_t phnum,
                 Elf64_Addr vaddr, size_t *offset_out)
@@ -343,6 +371,9 @@ vaddr_to_offset(const struct elf_image *image, const Elf64_Phdr *phdrs, size_t p
   return false;
 }
 
+/* Parses image's PT_DYNAMIC section into info: soname, rpath/runpath
+ * presence, runpath string, and the DT_NEEDED list. False if the ELF is
+ * malformed, truncated, or missing a usable string table. */
 static bool
 parse_dynamic_info(const struct elf_image *image, struct dynamic_info *info)
 {
@@ -471,6 +502,8 @@ parse_dynamic_info(const struct elf_image *image, struct dynamic_info *info)
   return true;
 }
 
+/* Reports whether the ELF file at path is soname: matched by its DT_SONAME
+ * if present, otherwise by its filename. */
 static bool
 soname_matches(const char *path, const char *soname)
 {
@@ -495,7 +528,10 @@ soname_matches(const char *path, const char *soname)
   return match;
 }
 
-/* A colon-separated search path is usable only if every entry is an immutable
+/* Reports whether every entry of a colon-separated search path is a
+ * cacheable store path.
+ *
+ * A colon-separated search path is usable only if every entry is an immutable
  * store path with no dynamic string tokens. $ORIGIN and friends are rejected
  * rather than expanded so the cached answer cannot depend on load context. */
 static bool
@@ -535,7 +571,10 @@ search_path_is_cacheable(const char *search_path)
   return true;
 }
 
-/* A symlink inside a store directory is itself immutable: Nix hashes the link's
+/* Result of directory_holds_soname(): whether soname exists in a directory
+ * and, if so, whether it resolves inside the store.
+ *
+ * A symlink inside a store directory is itself immutable: Nix hashes the link's
  * target string, so the link and where it points are both fixed by the store
  * path. Following it is therefore safe and is what glibc does. What must not be
  * cached is the resolved target when it lands outside the store, since only the
@@ -546,7 +585,10 @@ enum soname_probe {
   SONAME_UNSAFE,
 };
 
-/* A directory can hold a regular file matching soname whose realpath()
+/* Reports whether dir contains a regular file named soname, and whether it is
+ * safe to cache.
+ *
+ * A directory can hold a regular file matching soname whose realpath()
  * escapes the store (an attacker-built package can put anything it wants
  * inside its own store paths). glibc does not care where a match resolves:
  * it loads the first directory with a matching name, unconditionally. So an
@@ -625,7 +667,10 @@ first_hit_in_search_path(const char *search_path, const char *soname, bool *unsa
   return NULL;
 }
 
-/* Must stay byte-identical to cache_scope_key() in nix-ld-cache-audit.c. */
+/* Builds the cache lookup key for a (requester, LD_LIBRARY_PATH) scope, or
+ * NULL on allocation failure.
+ *
+ * Must stay byte-identical to cache_scope_key() in nix-ld-cache-audit.c. */
 static char *
 cache_scope_key(const char *requester_path, const char *ld_library_path)
 {
@@ -640,6 +685,8 @@ cache_scope_key(const char *requester_path, const char *ld_library_path)
   return key;
 }
 
+/* Returns "<cache_dir>/<hash>.tsv" for the (requester, ld_library_path)
+ * scope, or NULL on allocation failure. */
 static char *
 cache_file_path(const char *cache_dir, const char *requester_path, const char *ld_library_path)
 {
@@ -659,6 +706,8 @@ cache_file_path(const char *cache_dir, const char *requester_path, const char *l
   return path;
 }
 
+/* Reads cache_path's entire contents into a malloc'd buffer. Returns an
+ * empty (non-NULL) buffer if the file does not exist, or NULL on error. */
 static char *
 read_scope_file(const char *cache_path, size_t *len_out)
 {
@@ -715,6 +764,7 @@ read_scope_file(const char *cache_path, size_t *len_out)
   return buf;
 }
 
+/* Frees a cache slot's owned memory and clears it to empty. */
 static void
 write_scope_cache_reset(struct write_scope_cache *cache)
 {
@@ -723,6 +773,7 @@ write_scope_cache_reset(struct write_scope_cache *cache)
   memset(cache, 0, sizeof(*cache));
 }
 
+/* Returns the live cache slot for cache_path, or NULL if not cached. */
 static struct write_scope_cache *
 write_scope_cache_find(const char *cache_path)
 {
@@ -737,6 +788,8 @@ write_scope_cache_find(const char *cache_path)
   return NULL;
 }
 
+/* Picks the slot to evict for a new entry: an empty slot if one exists,
+ * otherwise the least-recently-used one. */
 static struct write_scope_cache *
 write_scope_cache_victim(void)
 {
@@ -755,7 +808,8 @@ write_scope_cache_victim(void)
   return victim;
 }
 
-/* NULL `st` means the file does not currently exist. */
+/* Reports whether cache's recorded file identity still matches st.
+ * NULL `st` means the file does not currently exist. */
 static bool
 write_scope_cache_matches(const struct write_scope_cache *cache, const struct stat *st)
 {
@@ -768,6 +822,8 @@ write_scope_cache_matches(const struct write_scope_cache *cache, const struct st
     && cache->mtim.tv_nsec == st->st_mtim.tv_nsec;
 }
 
+/* Records st's identity into cache, or marks the file absent if st is
+ * NULL. */
 static void
 write_scope_cache_set_stat(struct write_scope_cache *cache, const struct stat *st)
 {
@@ -780,6 +836,9 @@ write_scope_cache_set_stat(struct write_scope_cache *cache, const struct stat *s
   }
 }
 
+/* Returns the in-memory cache slot for cache_path, reloading it from disk if
+ * it is not yet cached or has changed underneath the daemon. NULL on
+ * error. */
 static struct write_scope_cache *
 write_scope_cache_load(const char *cache_path)
 {
@@ -822,6 +881,7 @@ write_scope_cache_load(const char *cache_path)
   return cache;
 }
 
+/* Reports whether cache's contents already have a "soname\tpath" line. */
 static bool
 write_scope_cache_contains_line(const struct write_scope_cache *cache,
                                 const char *soname, const char *path)
@@ -853,6 +913,8 @@ write_scope_cache_contains_line(const struct write_scope_cache *cache,
   return false;
 }
 
+/* Appends a pre-formatted "soname\tpath\n" line to cache's in-memory
+ * contents. */
 static int
 write_scope_cache_append_line(struct write_scope_cache *cache, const char *line, size_t line_len)
 {
@@ -868,6 +930,9 @@ write_scope_cache_append_line(struct write_scope_cache *cache, const char *line,
   return 0;
 }
 
+/* Records a derived (soname -> path) resolution for this scope: appends it
+ * to the on-disk cache file and mirrors the append into the in-memory
+ * cache, unless it is already present in either. */
 static void
 commit_cache_entry(const char *cache_dir, const char *requester_path,
                    const char *ld_library_path, const char *soname, const char *path)
@@ -1022,6 +1087,9 @@ out:
   return hit;
 }
 
+/* Validates and handles one fully-received client request: derives a
+ * resolution for (requester, soname, ld_library_path) and commits it on a
+ * hit. */
 static void
 process_message(struct connection *conn, const char *cache_dir)
 {
@@ -1048,6 +1116,8 @@ process_message(struct connection *conn, const char *cache_dir)
   free(resolved);
 }
 
+/* Closes and frees a connection's resources, resetting the slot to
+ * unused. */
 static void
 connection_close(struct connection *conn)
 {
@@ -1059,6 +1129,8 @@ connection_close(struct connection *conn)
   conn->fd = -1;
 }
 
+/* Validates a received protocol header's magic, version, and field-length
+ * bounds. */
 static bool
 header_is_sane(const struct nix_ld_cache_msg *msg)
 {
@@ -1086,7 +1158,9 @@ terminate_payload_fields(struct connection *conn)
   buf[rlen + 1 + slen + 1 + llen] = '\0';
 }
 
-/* Returns false when the connection is finished and should be dropped. */
+/* Reads and processes as much of one connection as is available without
+ * blocking, advancing it from header to payload to a handled message.
+ * Returns false when the connection is finished and should be dropped. */
 static bool
 connection_read(struct connection *conn, const char *cache_dir)
 {
@@ -1143,6 +1217,8 @@ connection_read(struct connection *conn, const char *cache_dir)
   }
 }
 
+/* Creates, binds, and listens on socket_path; returns the listening fd, or
+ * -1 on error. */
 static int
 listen_socket(const char *socket_path)
 {
@@ -1180,6 +1256,8 @@ listen_socket(const char *socket_path)
   return fd;
 }
 
+/* Accepts all currently-pending connections, assigning each a free slot in
+ * conns and registering it with epoll. */
 static void
 accept_connections(int listen_fd, int epoll_fd, struct connection *conns, size_t *live_count)
 {
@@ -1232,6 +1310,8 @@ accept_connections(int listen_fd, int epoll_fd, struct connection *conns, size_t
   }
 }
 
+/* Milliseconds until the soonest connection deadline, or -1 if none are
+ * live. */
 static int
 next_timeout_ms(const struct connection *conns, size_t live_count)
 {
@@ -1254,6 +1334,7 @@ next_timeout_ms(const struct connection *conns, size_t live_count)
   return soonest <= now ? 0 : (int) (soonest - now);
 }
 
+/* Closes any connection past its deadline. */
 static void
 expire_connections(struct connection *conns, size_t *live_count)
 {
@@ -1267,6 +1348,8 @@ expire_connections(struct connection *conns, size_t *live_count)
   }
 }
 
+/* Entry point: parses arguments, sets up the listening socket and epoll
+ * loop, and serves requests until SIGINT/SIGTERM. */
 int
 main(int argc, char **argv)
 {
