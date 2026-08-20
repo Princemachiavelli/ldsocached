@@ -15,6 +15,7 @@ let
   # "User or group with specified name already exists").
   cacheGroup = "nix-ld-cache-readers";
   auditLibraryPath = "/run/current-system/sw/lib/nix-ld-cache.so";
+  execInjectLibraryPath = "/run/current-system/sw/lib/nix-ld-cache-execinject.so";
   auditEnvironment = {
     LD_AUDIT = auditLibraryPath;
     NIX_LD_AUDIT_CACHE_DIR = cfg.cacheDir;
@@ -27,6 +28,16 @@ let
   auditEnvironmentString = lib.concatStringsSep " " (
     lib.mapAttrsToList (name: value: "${name}=${lib.escapeShellArg value}") auditEnvironment
   );
+  # nix-daemon's own execve() interposer (nix-ld-cache-exec-inject.c) reads
+  # this to know which of its own env vars to splice into every process it
+  # launches, sandboxed builds included -- nix.conf's impure-env only ever
+  # reaches fixed-output derivations that also opt in via impureEnvVars, so
+  # it cannot do this. Derived from auditEnvironment so no variable, and
+  # crucially not LD_PRELOAD itself, can be missed or wrongly included.
+  daemonExecInjectEnvironment = {
+    LD_PRELOAD = execInjectLibraryPath;
+    NIX_LD_CACHE_INJECT_VARS = lib.concatStringsSep " " (lib.attrNames auditEnvironment);
+  };
 in
 {
   options.programs.nix-ld-cache = {
@@ -56,7 +67,7 @@ in
     nixSandboxIntegration = lib.mkOption {
       type = lib.types.bool;
       default = true;
-      description = "Expose the shared cache and daemon socket to Nix sandboxes and configure nix-daemon to export the audit environment.";
+      description = "Expose the shared cache and daemon socket to Nix sandboxes, and make nix-daemon inject the audit environment into every process it execs, including sandboxed derivation builds.";
     };
 
     staticTlsSurplus = lib.mkOption {
@@ -83,15 +94,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion =
-          !cfg.nixSandboxIntegration
-          || lib.elem "configurable-impure-env" (config.nix.settings.experimental-features or [ ]);
-        message = "programs.nix-ld-cache.nixSandboxIntegration sets nix.settings.impure-env, which requires the configurable-impure-env experimental feature. Add it to nix.settings.experimental-features or set nixSandboxIntegration = false.";
-      }
-    ];
-
     environment.systemPackages = [ cfg.package ];
 
     # The shared cache must be world-readable: every audited process reads it
@@ -113,18 +115,20 @@ in
     systemd.user.settings.Manager.DefaultEnvironment = auditEnvironmentString;
 
     nix.settings = lib.mkIf cfg.nixSandboxIntegration {
+      # Bind-mounted into every sandboxed build's chroot so the builder
+      # process (once execve() has the LD_AUDIT env var, see
+      # daemonExecInjectEnvironment below) can actually open the audit
+      # module and reach the daemon socket from inside the sandbox.
       extra-sandbox-paths = [
         cfg.cacheDir
         auditLibraryPath
         "/run/${runtimeName}"
       ];
-      # Derived from auditEnvironment so no variable can be missed here: the
-      # scope key includes GLIBC_TUNABLES, so a mismatch between contexts would
-      # silently split the cache.
-      impure-env = lib.mapAttrsToList (name: value: "${name}=${value}") auditEnvironment;
     };
 
-    systemd.services.nix-daemon.environment = lib.mkIf cfg.nixSandboxIntegration auditEnvironment;
+    systemd.services.nix-daemon.environment = lib.mkIf cfg.nixSandboxIntegration (
+      auditEnvironment // daemonExecInjectEnvironment
+    );
 
     systemd.services.nix-ld-cache = {
       description = "nix-ld-cache privileged cache writer";

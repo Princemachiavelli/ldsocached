@@ -52,6 +52,13 @@ stdenv.mkDerivation {
     $CC -O2 -Wall -Wextra -Wformat -Wformat-security \
       -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE -pie -Wl,-z,relro,-z,now \
       -o nix-ld-cache-daemon nix-ld-cache-daemon.c
+
+    # Ordinary glibc-linked shared object: it is LD_PRELOADed only into
+    # nix-daemon's own process, which is built against the same glibc, so
+    # none of the freestanding constraints above apply here.
+    $CC -O2 -Wall -Wextra -Wformat -Wformat-security -fPIC -shared \
+      -D_FORTIFY_SOURCE=3 -fstack-protector-strong -Wl,-z,relro,-z,now \
+      -o libnix-ld-cache-execinject.so nix-ld-cache-exec-inject.c -ldl
     runHook postBuild
   '';
 
@@ -61,6 +68,9 @@ stdenv.mkDerivation {
     cp libnix-ld-cache-audit.so $out/lib/
     $STRIP --strip-unneeded $out/lib/libnix-ld-cache-audit.so
     ln -s libnix-ld-cache-audit.so $out/lib/nix-ld-cache.so
+    cp libnix-ld-cache-execinject.so $out/lib/
+    $STRIP --strip-unneeded $out/lib/libnix-ld-cache-execinject.so
+    ln -s libnix-ld-cache-execinject.so $out/lib/nix-ld-cache-execinject.so
     cp nix-ld-cache-daemon $out/bin/
     cp benchmark.sh $out/bin/nix-ld-cache-benchmark
     chmod +x $out/bin/nix-ld-cache-benchmark
