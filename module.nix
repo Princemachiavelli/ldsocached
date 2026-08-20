@@ -137,12 +137,22 @@ in
       # Bind-mounted into every sandboxed build's chroot so the builder
       # process (once execve() has the LD_AUDIT env var, see
       # daemonAuditEnvironment above) can actually open the audit module and
-      # reach the daemon socket from inside the sandbox. The audit module
-      # must be the real store path (auditLibraryStorePath), not the
-      # auditLibraryPath alias: see its definition above.
+      # reach the daemon socket from inside the sandbox.
+      #
+      # This must be the whole package output, not auditLibraryStorePath's
+      # specific .so file: any sandbox-paths entry that resolves inside the
+      # store gets its *containing store path*'s closure added as a second,
+      # separate chroot entry (derivation-building-goal.cc's
+      # defaultPathsInChroot construction), keyed by that bare store path.
+      # That second entry sorts before ours (a prefix always sorts first)
+      # and lands first as a real, 0555 recursive directory bind -- so our
+      # own narrower entry then fails opening its placeholder file with
+      # EACCES: it needs write access to the (now real, read-only) parent
+      # directory it lands in. Listing the package path directly is exactly
+      # what Nix ends up mounting anyway, without a second entry to conflict.
       extra-sandbox-paths = [
         cfg.cacheDir
-        auditLibraryStorePath
+        "${cfg.package}"
         "/run/${runtimeName}"
       ];
     };
