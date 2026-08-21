@@ -37,6 +37,18 @@
  * module.nix stays the single source of truth for the variable set). */
 #define INJECT_VARS_ENV "NIX_LD_CACHE_INJECT_VARS"
 
+/* ld.so has already mapped this shim into nix-daemon by the time any
+ * constructor runs, so dropping LD_PRELOAD from environ() here does not
+ * unload it -- it only keeps it from being inherited by processes
+ * nix-daemon execs with an envp built from its own environ (e.g. spawning
+ * ssh for remote builders/substituters), which would otherwise load this
+ * shim into ssh and, transitively, everything ssh forks. Sandboxed
+ * derivation builds are unaffected: their envp is built fresh and never
+ * contained LD_PRELOAD to begin with. */
+__attribute__((constructor)) static void strip_ld_preload(void) {
+    unsetenv("LD_PRELOAD");
+}
+
 /* Signature of libc's execve(). */
 typedef int (*execve_fn)(const char *, char *const[], char *const[]);
 
